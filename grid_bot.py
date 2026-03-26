@@ -11,6 +11,7 @@ import random
 import time
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -29,7 +30,8 @@ GRID_SPREAD     = float(os.getenv("GRID_SPREAD", 0.005))
 PRICE_RANGE_PCT = float(os.getenv("PRICE_RANGE_PCT", 0.05))
 STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", 0.08))
 MAX_OPEN_ORDERS = int(os.getenv("MAX_OPEN_ORDERS", 20))
-TAKER_FEE       = float(os.getenv("TAKER_FEE", 0.001))  # 0.1% par défaut (MEXC)
+MAKER_FEE       = float(os.getenv("MAKER_FEE", 0.0))    # 0% maker (MEXC)
+TAKER_FEE       = float(os.getenv("TAKER_FEE", 0.001))  # 0.1% taker (MEXC)
 MAX_FILLED_HISTORY = int(os.getenv("MAX_FILLED_HISTORY", 500))
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 PAPER_TRADING   = os.getenv("PAPER_TRADING", "true").lower() == "true"
@@ -47,7 +49,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE),
+        RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=3),
         logging.StreamHandler()
     ]
 )
@@ -311,17 +313,28 @@ def check_fills_live(exchange, state: dict):
         return
 
     grid_orders = state.get("grid_orders", {})
-    filled_ids = [oid for oid in grid_orders if oid not in open_order_ids]
+    missing_ids = [oid for oid in grid_orders if oid not in open_order_ids]
 
-    for oid in filled_ids:
+    for oid in missing_ids:
+        # Vérifier si l'ordre a vraiment été rempli (pas annulé)
+        try:
+            order_info = exchange.fetch_order(oid, SYMBOL)
+            status = order_info.get("status", "")
+            if status in ("canceled", "cancelled", "expired", "rejected"):
+                log.warning(f"⚠️ Ordre {oid} annulé/expiré sur l'exchange (status: {status}) — ignoré")
+                grid_orders.pop(oid)
+                continue
+        except Exception:
+            pass  # Si fetch_order échoue, on suppose fill (comportement legacy)
+
         order = grid_orders.pop(oid)
         fill_price = order["price"]
         size = order["size"]
         side = order["side"]
         is_counter = order.get("is_counter", False)
 
-        # Frais sur chaque fill (buy ou sell)
-        fee = fill_price * size * TAKER_FEE
+        # Frais maker sur chaque fill (ordres limit = toujours maker)
+        fee = fill_price * size * MAKER_FEE
         # Profit uniquement sur les contre-ordres (cycle buy+sell complété)
         profit = -fee
         if is_counter:
@@ -408,13 +421,16 @@ class PaperExchange:
         return self._create_order("sell", symbol, amount, price)
 
     def fetch_open_orders(self, symbol: str) -> list:
-        # Simuler les fills avant de retourner les ordres ouverts
         self._simulate_fills()
-        return [o for o in self.orders.values() if o["status"] == "open"]
+        return list(self.orders.values())
 
     def cancel_order(self, oid: str, symbol: str):
         if oid in self.orders:
             del self.orders[oid]
+
+    def fetch_order(self, oid: str, symbol: str) -> dict:
+        # En paper trading, les ordres disparus sont toujours des fills
+        return {"id": oid, "status": "closed"}
 
     def fetch_balance(self):
         base_asset = SYMBOL.split("/")[0]
@@ -425,16 +441,12 @@ class PaperExchange:
         }
 
     def _simulate_fills(self):
-        """Simule des fills aléatoires sur les ordres ouverts."""
-        filled_ids = []
-        for oid, order in self.orders.items():
-            if order["status"] != "open":
-                continue
-            if order["side"] == "buy" and self.price <= order["price"]:
-                filled_ids.append(oid)
-            elif order["side"] == "sell" and self.price >= order["price"]:
-                filled_ids.append(oid)
-        # Retirer les ordres remplis (seuls les open restent)
+        """Simule les fills quand le prix croise un niveau."""
+        filled_ids = [
+            oid for oid, o in self.orders.items()
+            if (o["side"] == "buy" and self.price <= o["price"])
+            or (o["side"] == "sell" and self.price >= o["price"])
+        ]
         for oid in filled_ids:
             del self.orders[oid]
 

@@ -38,7 +38,8 @@ def parse_args():
     parser.add_argument("--spread", type=float, default=float(os.getenv("GRID_SPREAD", 0.005)))
     parser.add_argument("--range-pct", type=float, default=float(os.getenv("PRICE_RANGE_PCT", 0.05)))
     parser.add_argument("--stop-loss", type=float, default=float(os.getenv("STOP_LOSS_PCT", 0.08)))
-    parser.add_argument("--fee", type=float, default=0.001, help="Frais taker (defaut: 0.1%%)")
+    parser.add_argument("--maker-fee", type=float, default=float(os.getenv("MAKER_FEE", 0.0)), help="Frais maker (defaut: 0%% MEXC)")
+    parser.add_argument("--taker-fee", type=float, default=float(os.getenv("TAKER_FEE", 0.001)), help="Frais taker (defaut: 0.1%% MEXC)")
     parser.add_argument("--timeframe", default="1h", help="Timeframe des bougies (defaut: 1h)")
     return parser.parse_args()
 
@@ -74,13 +75,14 @@ def fetch_candles(exchange, symbol: str, timeframe: str, days: int) -> list:
 
 
 class GridBacktester:
-    def __init__(self, capital, levels, spread, range_pct, stop_loss_pct, fee):
+    def __init__(self, capital, levels, spread, range_pct, stop_loss_pct, maker_fee, taker_fee):
         self.capital = capital
         self.levels = levels
         self.spread = spread
         self.range_pct = range_pct
         self.stop_loss_pct = stop_loss_pct
-        self.fee = fee
+        self.maker_fee = maker_fee
+        self.taker_fee = taker_fee
 
         self.grid_orders = {}
         self.total_profit = 0.0
@@ -148,16 +150,16 @@ class GridBacktester:
             side = order["side"]
             is_counter = order["is_counter"]
 
-            fee = fill_price * size * self.fee
+            # Ordres limit = maker fee
+            fee = fill_price * size * self.maker_fee
             self.total_fees += fee
 
-            profit = 0.0
+            profit = -fee
             if is_counter:
-                profit = fill_price * self.spread * size - fee
-                self.total_profit += profit
+                gross = fill_price * self.spread * size
+                profit = gross - 2 * fee  # frais sur les 2 fills du cycle
                 self.cycles_completed += 1
-            else:
-                self.total_profit -= fee
+            self.total_profit += profit
 
             self.total_trades += 1
             self.fills.append({
@@ -221,7 +223,7 @@ def display_results(bt: GridBacktester, candles: list, args):
     config.add_row("Capital", f"{bt.capital:.2f} USDT")
     config.add_row("Niveaux", f"{bt.levels} x2 = {bt.levels * 2} ordres")
     config.add_row("Spread", f"{bt.spread * 100:.2f}%")
-    config.add_row("Frais", f"{bt.fee * 100:.2f}%")
+    config.add_row("Frais", f"maker {bt.maker_fee * 100:.2f}% / taker {bt.taker_fee * 100:.2f}%")
     config.add_row("Bougies", f"{len(candles)} ({args.timeframe})")
 
     console.print(Panel(config, title="[bold]Configuration[/bold]", border_style="blue"))
@@ -333,7 +335,8 @@ def main():
         spread=args.spread,
         range_pct=args.range_pct,
         stop_loss_pct=args.stop_loss,
-        fee=args.fee,
+        maker_fee=args.maker_fee,
+        taker_fee=args.taker_fee,
     )
 
     with Progress(console=console) as progress:
