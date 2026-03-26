@@ -83,7 +83,7 @@ docker compose exec grid-bot python dashboard.py
 ```
 
 Le dashboard affiche :
-- **Header** : prix actuel, drift, profit, ROI, nombre de trades, uptime
+- **Header** : prix actuel, drift, profit, ROI, nombre de trades, uptime, portefeuille, capital alloue
 - **Grille** : ordres SELL (rouge) et BUY (vert), contre-ordres en gras
 - **Fills** : 15 derniers fills avec type (init/cycle) et profit
 - **Solde** : USDT et asset avec repartition libre/en ordres/total + valeur en USDT
@@ -100,7 +100,7 @@ python backtest.py 30
 python backtest.py 7 --symbol ETH/USDT
 
 # Tester differents parametres :
-python backtest.py 90 --spread 0.008 --levels 12 --capital 200
+python backtest.py 90 --spread 0.008 --levels 12
 
 # Toutes les options :
 python backtest.py --help
@@ -126,11 +126,13 @@ Le backtester affiche : profit net, ROI, ROI/jour, projection mensuelle, drawdow
 
 | Parametre | Valeur conseillee | Description |
 |---|---|---|
+| `CAPITAL_ALLOCATION` | 80-95 | % du portefeuille a allouer (auto-compound) |
 | `GRID_LEVELS` | 8-12 | Niveaux de la grille |
 | `GRID_SPREAD` | 0.004-0.008 | Ecart entre niveaux (0.5-0.8%) |
 | `PRICE_RANGE_PCT` | 0.05 | Recentre si prix sort de +/-5% |
-| `STOP_LOSS_PCT` | 0.08 | Stop global a -8% du capital |
-| `CAPITAL` | 80 | Capital en USDT |
+| `STOP_LOSS_PCT` | 0.08 | Stop global a -8% du portefeuille |
+| `MAKER_FEE` | 0.0 | Frais maker (0% sur MEXC) |
+| `TAKER_FEE` | 0.001 | Frais taker (0.1% sur MEXC) |
 | `MAX_OPEN_ORDERS` | 20 | Nombre max d'ordres simultanes |
 
 ## Notifications Discord

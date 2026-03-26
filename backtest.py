@@ -33,7 +33,7 @@ def parse_args():
     parser.add_argument("days", type=int, help="Nombre de jours a backtester")
     parser.add_argument("--symbol", default=os.getenv("SYMBOL", "BTC/USDT"))
     parser.add_argument("--exchange", default=os.getenv("EXCHANGE", "mexc"))
-    parser.add_argument("--capital", type=float, default=float(os.getenv("CAPITAL", 80)))
+    parser.add_argument("--capital", type=float, default=80, help="Capital simule en USDT (defaut: 80)")
     parser.add_argument("--levels", type=int, default=int(os.getenv("GRID_LEVELS", 10)))
     parser.add_argument("--spread", type=float, default=float(os.getenv("GRID_SPREAD", 0.005)))
     parser.add_argument("--range-pct", type=float, default=float(os.getenv("PRICE_RANGE_PCT", 0.05)))

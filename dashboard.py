@@ -27,7 +27,6 @@ load_dotenv()
 
 STATE_FILE = sys.argv[1] if len(sys.argv) > 1 else os.getenv("STATE_FILE", "data/bot_state.json")
 SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
-CAPITAL = float(os.getenv("CAPITAL", 80))
 GRID_SPREAD = float(os.getenv("GRID_SPREAD", 0.005))
 REFRESH_INTERVAL = 2
 
@@ -63,8 +62,12 @@ def build_header(state: dict) -> Panel:
     elapsed = format_elapsed(state.get("start_time", ""))
     profit = state.get("total_profit", 0)
     trades = state.get("total_trades", 0)
-    roi = (profit / CAPITAL * 100) if CAPITAL else 0
+    start_val = state.get("start_portfolio_value") or 1
+    roi = profit / start_val * 100
     active = len(state.get("grid_orders", {}))
+    portfolio = state.get("portfolio_value", 0)
+    capital = state.get("effective_capital", 0)
+    alloc = state.get("capital_allocation", 0)
 
     profit_color = "green" if profit >= 0 else "red"
     roi_color = "green" if roi >= 0 else "red"
@@ -84,10 +87,15 @@ def build_header(state: dict) -> Panel:
     header.append(f"{roi:+.2f}%", style=f"bold {roi_color}")
     header.append(f"  |  Trades: ", style="dim")
     header.append(f"{trades}", style="bold white")
-    header.append(f"  |  Ordres actifs: ", style="dim")
+    header.append(f"  |  Ordres: ", style="dim")
     header.append(f"{active}", style="bold white")
     header.append(f"  |  Uptime: ", style="dim")
     header.append(f"{elapsed}", style="white")
+    header.append(f"\n  Portefeuille: ", style="dim")
+    header.append(f"{portfolio:.2f} USDT", style="bold white")
+    header.append(f"  |  Capital alloue: ", style="dim")
+    header.append(f"{capital:.2f} USDT", style="bold cyan")
+    header.append(f" ({alloc:.0f}%)", style="dim")
 
     return Panel(header, title="[bold]Grid Trading Bot[/bold]", border_style="blue")
 
@@ -192,9 +200,10 @@ def build_balance_panel(state: dict) -> Panel:
     total_value = q_total + b_value
     table.add_row("", "", "", "[bold]Total[/bold]", f"[bold]{total_value:.2f}[/bold]")
 
-    pnl = total_value - CAPITAL if total_value > 0 else 0
+    start_val = state.get("start_portfolio_value") or total_value
+    pnl = total_value - start_val if total_value > 0 else 0
     pnl_color = "green" if pnl >= 0 else "red"
-    subtitle = f"[dim]Capital initial: {CAPITAL:.2f} USDT  |  PnL: [{pnl_color}]{pnl:+.2f} USDT[/{pnl_color}][/dim]"
+    subtitle = f"[dim]Depart: {start_val:.2f} USDT  |  PnL: [{pnl_color}]{pnl:+.2f} USDT[/{pnl_color}][/dim]"
     return Panel(table, title=f"[bold]Solde {SYMBOL.split('/')[1]}[/bold]", subtitle=subtitle, border_style="green")
 
 
@@ -246,7 +255,7 @@ def build_fills_table(state: dict) -> Panel:
 def build_dashboard(state: dict) -> Layout:
     layout = Layout()
     layout.split_column(
-        Layout(name="header", size=6),
+        Layout(name="header", size=7),
         Layout(name="body"),
         Layout(name="footer", size=5),
     )

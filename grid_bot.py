@@ -24,7 +24,8 @@ EXCHANGE_ID     = os.getenv("EXCHANGE", "mexc")
 API_KEY         = os.getenv("API_KEY", "")
 API_SECRET      = os.getenv("API_SECRET", "")
 SYMBOL          = os.getenv("SYMBOL", "BTC/USDT")
-CAPITAL         = float(os.getenv("CAPITAL", 80))
+CAPITAL_ALLOC   = float(os.getenv("CAPITAL_ALLOCATION", 90))  # % du portefeuille
+MIN_CAPITAL     = float(os.getenv("MIN_CAPITAL", 30))        # minimum USDT pour trader
 GRID_LEVELS     = int(os.getenv("GRID_LEVELS", 10))
 GRID_SPREAD     = float(os.getenv("GRID_SPREAD", 0.005))
 PRICE_RANGE_PCT = float(os.getenv("PRICE_RANGE_PCT", 0.05))
@@ -69,11 +70,14 @@ def load_state() -> dict:
         "filled_orders": [],
         "total_profit": 0.0,
         "total_trades": 0,
-        "start_capital": CAPITAL,
         "start_time": datetime.now().isoformat(),
         "grid_base_price": None,
         "current_price": None,
         "balance": {},           # {asset: {free, used, total}} from exchange
+        "portfolio_value": 0.0,
+        "effective_capital": 0.0,
+        "capital_allocation": CAPITAL_ALLOC,
+        "start_portfolio_value": None,  # valeur initiale pour calculer le ROI
     }
 
 def save_state(state: dict):
@@ -122,24 +126,35 @@ def init_exchange() -> ccxt.Exchange:
 
 # ─── BALANCE ─────────────────────────────────────────────────────────────────
 
-def fetch_balance(exchange, state: dict):
-    """Récupère le solde USDT et l'asset tradé depuis l'exchange."""
+def fetch_balance(exchange, state: dict, price: float = None):
+    """Récupère le solde, calcule la valeur du portefeuille et le capital effectif."""
     try:
         base_asset = SYMBOL.split("/")[0]   # ex: BTC
         quote_asset = SYMBOL.split("/")[1]  # ex: USDT
         balance = exchange.fetch_balance()
-        state["balance"] = {
-            quote_asset: {
-                "free": float(balance.get(quote_asset, {}).get("free", 0) or 0),
-                "used": float(balance.get(quote_asset, {}).get("used", 0) or 0),
-                "total": float(balance.get(quote_asset, {}).get("total", 0) or 0),
-            },
-            base_asset: {
-                "free": float(balance.get(base_asset, {}).get("free", 0) or 0),
-                "used": float(balance.get(base_asset, {}).get("used", 0) or 0),
-                "total": float(balance.get(base_asset, {}).get("total", 0) or 0),
-            },
+
+        q = {
+            "free": float(balance.get(quote_asset, {}).get("free", 0) or 0),
+            "used": float(balance.get(quote_asset, {}).get("used", 0) or 0),
+            "total": float(balance.get(quote_asset, {}).get("total", 0) or 0),
         }
+        b = {
+            "free": float(balance.get(base_asset, {}).get("free", 0) or 0),
+            "used": float(balance.get(base_asset, {}).get("used", 0) or 0),
+            "total": float(balance.get(base_asset, {}).get("total", 0) or 0),
+        }
+
+        state["balance"] = {quote_asset: q, base_asset: b}
+
+        # Valeur totale du portefeuille en quote (USDT)
+        p = price or state.get("current_price") or state.get("grid_base_price") or 0
+        portfolio_value = q["total"] + b["total"] * p
+        effective_capital = portfolio_value * CAPITAL_ALLOC / 100
+
+        state["portfolio_value"] = round(portfolio_value, 4)
+        state["effective_capital"] = round(effective_capital, 4)
+        state["capital_allocation"] = CAPITAL_ALLOC
+
     except Exception as e:
         log.warning(f"Impossible de récupérer le solde: {e}")
 
@@ -180,9 +195,9 @@ def compute_grid(base_price: float) -> list:
         })
     return levels
 
-def order_size(base_price: float) -> float:
+def order_size(base_price: float, capital: float) -> float:
     """Taille d'ordre en BTC par niveau (moitié du capital par côté)."""
-    size_usdt = (CAPITAL / 2) / GRID_LEVELS
+    size_usdt = (capital / 2) / GRID_LEVELS
     return round(size_usdt / base_price, 6)
 
 # ─── PLACEMENT DE LA GRILLE ───────────────────────────────────────────────────
@@ -204,10 +219,20 @@ def place_grid(exchange, state: dict):
 
     price = get_current_price(exchange)
     state["grid_base_price"] = price
-    size = order_size(price)
+
+    # Calculer le capital effectif depuis le solde exchange
+    fetch_balance(exchange, state, price)
+    capital = state.get("effective_capital", 0)
+    if capital < MIN_CAPITAL:
+        msg = f"❌ Capital insuffisant: {capital:.2f} USDT (minimum: {MIN_CAPITAL:.0f} USDT)"
+        log.error(msg)
+        notify(msg, color=0xff0000)
+        return
+
+    size = order_size(price, capital)
     grid = compute_grid(price)
 
-    log.info(f"📐 Grille @ {price:.2f} | {GRID_LEVELS} niveaux × {GRID_SPREAD*100:.2f}% | taille: {size} BTC")
+    log.info(f"📐 Grille @ {price:.2f} | Capital: {capital:.2f} USDT ({CAPITAL_ALLOC:.0f}% de {state.get('portfolio_value', 0):.2f}) | taille: {size} BTC")
 
     placed = {}
     errors = 0
@@ -242,7 +267,7 @@ def place_grid(exchange, state: dict):
     notify(
         f"🚀 **Grille placée — {SYMBOL}**\n"
         f"Prix: `{price:.2f}` | Niveaux: `{GRID_LEVELS}×2` | Spread: `{GRID_SPREAD*100:.1f}%`\n"
-        f"Taille/niveau: `{size} BTC` | Capital: `{CAPITAL} USDT`\n"
+        f"Taille/niveau: `{size} BTC` | Capital: `{capital:.2f} USDT` ({CAPITAL_ALLOC:.0f}%)\n"
         f"Ordres placés: `{len(placed)}` | Erreurs: `{errors}`"
     )
 
@@ -265,9 +290,16 @@ def rebalance_grid(exchange, state: dict, new_price: float):
 
     log.info(f"♻️ Rebalance: {len(initial_orders)} ordres initiaux annulés, {len(counter_orders)} contre-ordres préservés")
 
-    # Placer de nouveaux ordres initiaux autour du nouveau prix
+    # Recalculer le capital effectif (compounding)
     state["grid_base_price"] = new_price
-    size = order_size(new_price)
+    fetch_balance(exchange, state, new_price)
+    capital = state.get("effective_capital", 0)
+    if capital < MIN_CAPITAL:
+        log.error(f"❌ Capital insuffisant pour rebalance: {capital:.2f} USDT (minimum: {MIN_CAPITAL:.0f} USDT)")
+        state["grid_orders"] = counter_orders
+        return
+
+    size = order_size(new_price, capital)
     grid = compute_grid(new_price)
 
     new_orders = dict(counter_orders)  # Garder les contre-ordres
@@ -379,6 +411,8 @@ def check_fills_live(exchange, state: dict):
 
 # ─── PAPER TRADING ────────────────────────────────────────────────────────────
 
+PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", 100))  # Solde USDT simulé
+
 class PaperExchange:
     """Simulateur d'exchange pour paper trading."""
 
@@ -386,6 +420,8 @@ class PaperExchange:
         self.price = base_price
         self.orders: dict = {}
         self._order_id = 1000
+        self._usdt = PAPER_BALANCE
+        self._btc = 0.0
 
     def _new_id(self) -> str:
         self._order_id += 1
@@ -435,9 +471,12 @@ class PaperExchange:
     def fetch_balance(self):
         base_asset = SYMBOL.split("/")[0]
         quote_asset = SYMBOL.split("/")[1]
+        # Calculer le USDT bloqué dans les ordres buy
+        used_usdt = sum(o["amount"] * o["price"] for o in self.orders.values() if o["side"] == "buy")
+        used_btc = sum(o["amount"] for o in self.orders.values() if o["side"] == "sell")
         return {
-            quote_asset: {"free": CAPITAL * 0.5, "used": CAPITAL * 0.5, "total": CAPITAL},
-            base_asset: {"free": 0.001, "used": 0.001, "total": 0.002},
+            quote_asset: {"free": self._usdt - used_usdt, "used": used_usdt, "total": self._usdt},
+            base_asset: {"free": self._btc - used_btc, "used": used_btc, "total": self._btc},
         }
 
     def _simulate_fills(self):
@@ -464,11 +503,15 @@ def status_report(state: dict) -> str:
     except Exception:
         pass
 
-    roi = (state["total_profit"] / CAPITAL * 100) if CAPITAL else 0
+    start_val = state.get("start_portfolio_value") or 1
+    roi = (state["total_profit"] / start_val * 100)
+    capital = state.get("effective_capital", 0)
+    portfolio = state.get("portfolio_value", 0)
     return (
         f"📊 **Rapport Grid Bot**\n"
         f"Durée: `{elapsed}` | Trades: `{state['total_trades']}`\n"
         f"Profit: `{state['total_profit']:.4f} USDT` | ROI: `{roi:.2f}%`\n"
+        f"Portefeuille: `{portfolio:.2f} USDT` | Capital alloué: `{capital:.2f} USDT` ({CAPITAL_ALLOC:.0f}%)\n"
         f"Ordres actifs: `{len(state.get('grid_orders', {}))}`"
     )
 
@@ -478,7 +521,7 @@ def main():
     log.info("🤖 Grid Trading Bot — démarrage")
     log.info(f"   Exchange : {EXCHANGE_ID.upper()}")
     log.info(f"   Paire    : {SYMBOL}")
-    log.info(f"   Capital  : {CAPITAL} USDT")
+    log.info(f"   Allocation: {CAPITAL_ALLOC}% du portefeuille")
     log.info(f"   Mode     : {'📄 PAPER TRADING' if PAPER_TRADING else '🔴 LIVE'}")
     log.info("=" * 60)
 
@@ -494,6 +537,20 @@ def main():
             log.error(f"❌ Impossible de se connecter à {EXCHANGE_ID}: {e}")
             notify(f"❌ **Erreur de connexion**\n`{e}`", color=0xff0000)
             raise
+
+    # Snapshot initial du portefeuille
+    init_price = get_current_price(exchange)
+    fetch_balance(exchange, state, init_price)
+    state["current_price"] = init_price
+    if not state.get("start_portfolio_value"):
+        state["start_portfolio_value"] = state.get("portfolio_value", 0)
+    log.info(f"💰 Portefeuille: {state['portfolio_value']:.2f} USDT | Capital alloué: {state['effective_capital']:.2f} USDT ({CAPITAL_ALLOC:.0f}%)")
+
+    if state["effective_capital"] < MIN_CAPITAL:
+        msg = f"❌ Capital insuffisant: {state['effective_capital']:.2f} USDT < {MIN_CAPITAL:.0f} USDT minimum — bot arrêté"
+        log.error(msg)
+        notify(msg, color=0xff0000)
+        raise SystemExit(msg)
 
     # Volatilité initiale
     vol = get_volatility(exchange)
@@ -533,8 +590,9 @@ def main():
             # Détecter les fills et placer les contre-ordres
             check_fills_live(exchange, state)
 
-            # Stop loss global
-            if state["total_profit"] < -(CAPITAL * STOP_LOSS_PCT):
+            # Stop loss global (basé sur la valeur initiale du portefeuille)
+            start_val = state.get("start_portfolio_value") or state.get("effective_capital") or 1
+            if state["total_profit"] < -(start_val * STOP_LOSS_PCT):
                 msg = f"🛑 **STOP LOSS DÉCLENCHÉ**\nPerte: `{state['total_profit']:.4f} USDT` ({STOP_LOSS_PCT*100:.0f}%)\nBot arrêté."
                 log.error(msg)
                 notify(msg, color=0xff0000)
