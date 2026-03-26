@@ -14,6 +14,9 @@ import os
 import sys
 import time
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+
+TZ = ZoneInfo("Europe/Paris")
 
 import ccxt
 from dotenv import load_dotenv
@@ -208,8 +211,8 @@ def display_results(bt: GridBacktester, candles: list, args):
     start_price = candles[0][1]
     end_price = candles[-1][4]
     hold_return = (end_price - start_price) / start_price * 100
-    start_date = datetime.fromtimestamp(candles[0][0] / 1000, tz=timezone.utc)
-    end_date = datetime.fromtimestamp(candles[-1][0] / 1000, tz=timezone.utc)
+    start_date = datetime.fromtimestamp(candles[0][0] / 1000, tz=TZ)
+    end_date = datetime.fromtimestamp(candles[-1][0] / 1000, tz=TZ)
 
     roi = (bt.total_profit / bt.capital * 100) if bt.capital else 0
     daily_roi = roi / args.days if args.days else 0
@@ -288,7 +291,7 @@ def display_results(bt: GridBacktester, candles: list, args):
         fills_table.add_column("Prix", justify="right")
         fills_table.add_column("Profit", justify="right", style="green")
         for f in top:
-            dt = datetime.fromtimestamp(f["time"] / 1000, tz=timezone.utc)
+            dt = datetime.fromtimestamp(f["time"] / 1000, tz=TZ)
             fills_table.add_row(
                 f"{dt:%Y-%m-%d %H:%M}",
                 f["side"].upper(),

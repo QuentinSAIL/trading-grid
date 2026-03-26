@@ -14,6 +14,9 @@ import os
 import sys
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+TZ = ZoneInfo("Europe/Paris")
 
 from dotenv import load_dotenv
 from rich.console import Console
@@ -42,7 +45,9 @@ def load_state() -> dict | None:
 def format_elapsed(start_time_str: str) -> str:
     try:
         start = datetime.fromisoformat(start_time_str)
-        delta = datetime.now() - start
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=TZ)
+        delta = datetime.now(TZ) - start
         total_s = int(delta.total_seconds())
         d = total_s // 86400
         h = (total_s % 86400) // 3600

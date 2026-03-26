@@ -7,13 +7,15 @@ Exchange : MEXC (maker 0%, taker 0.1%)
 import ccxt
 import os
 import math
-import random
 import time
 import json
 import logging
 from logging.handlers import RotatingFileHandler
 import requests
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+TZ = ZoneInfo("Europe/Paris")
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -70,7 +72,7 @@ def load_state() -> dict:
         "filled_orders": [],
         "total_profit": 0.0,
         "total_trades": 0,
-        "start_time": datetime.now().isoformat(),
+        "start_time": datetime.now(TZ).isoformat(),
         "grid_base_price": None,
         "current_price": None,
         "balance": {},           # {asset: {free, used, total}} from exchange
@@ -101,7 +103,7 @@ def notify(message: str, color: int = 0x00ff88):
                 "description": message,
                 "color": color,
                 "footer": {"text": f"Grid Bot | {SYMBOL} | {'📄 PAPER' if PAPER_TRADING else '🔴 LIVE'}"},
-                "timestamp": datetime.now(timezone.utc).isoformat()
+                "timestamp": datetime.now(TZ).isoformat()
             }]
         }
         r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=5)
@@ -224,10 +226,10 @@ def place_grid(exchange, state: dict):
     fetch_balance(exchange, state, price)
     capital = state.get("effective_capital", 0)
     if capital < MIN_CAPITAL:
-        msg = f"❌ Capital insuffisant: {capital:.2f} USDT (minimum: {MIN_CAPITAL:.0f} USDT)"
+        msg = f"❌ Capital insuffisant: {capital:.2f} USDT (minimum: {MIN_CAPITAL:.0f} USDT) — bot arrêté"
         log.error(msg)
         notify(msg, color=0xff0000)
-        return
+        raise SystemExit(msg)
 
     size = order_size(price, capital)
     grid = compute_grid(price)
@@ -253,7 +255,7 @@ def place_grid(exchange, state: dict):
                 "price": level["price"],
                 "size": size,
                 "index": level["index"],
-                "placed_at": datetime.now().isoformat(),
+                "placed_at": datetime.now(TZ).isoformat(),
                 "is_counter": False,
             }
             log.info(f"  ✅ {level['side'].upper()} @ {level['price']:.2f}")
@@ -295,9 +297,10 @@ def rebalance_grid(exchange, state: dict, new_price: float):
     fetch_balance(exchange, state, new_price)
     capital = state.get("effective_capital", 0)
     if capital < MIN_CAPITAL:
-        log.error(f"❌ Capital insuffisant pour rebalance: {capital:.2f} USDT (minimum: {MIN_CAPITAL:.0f} USDT)")
-        state["grid_orders"] = counter_orders
-        return
+        msg = f"❌ Capital insuffisant pour rebalance: {capital:.2f} USDT (minimum: {MIN_CAPITAL:.0f} USDT) — bot arrêté"
+        log.error(msg)
+        notify(msg, color=0xff0000)
+        raise SystemExit(msg)
 
     size = order_size(new_price, capital)
     grid = compute_grid(new_price)
@@ -320,7 +323,7 @@ def rebalance_grid(exchange, state: dict, new_price: float):
                 "price": level["price"],
                 "size": size,
                 "index": level["index"],
-                "placed_at": datetime.now().isoformat(),
+                "placed_at": datetime.now(TZ).isoformat(),
                 "is_counter": False,
             }
         except Exception as e:
@@ -376,7 +379,7 @@ def check_fills_live(exchange, state: dict):
         state["total_profit"] += profit
         state["total_trades"] += 1
 
-        fill_record = {**order, "fill_time": datetime.now().isoformat(), "profit": profit}
+        fill_record = {**order, "fill_time": datetime.now(TZ).isoformat(), "profit": profit}
         state["filled_orders"].append(fill_record)
 
         if is_counter:
@@ -400,7 +403,7 @@ def check_fills_live(exchange, state: dict):
                 "price": counter_price,
                 "size": size,
                 "index": order.get("index", 0),
-                "placed_at": datetime.now().isoformat(),
+                "placed_at": datetime.now(TZ).isoformat(),
                 "is_counter": True,
             }
             log.info(f"  ↩️ Contre-ordre {'SELL' if side == 'buy' else 'BUY'} @ {counter_price:.2f}")
@@ -414,33 +417,31 @@ def check_fills_live(exchange, state: dict):
 PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", 100))  # Solde USDT simulé
 
 class PaperExchange:
-    """Simulateur d'exchange pour paper trading."""
+    """Simulateur d'exchange pour paper trading — utilise les vrais prix du marché."""
 
-    def __init__(self, base_price: float):
-        self.price = base_price
+    def __init__(self):
+        self._real_exchange = getattr(ccxt, EXCHANGE_ID)({"enableRateLimit": True})
+        self._real_exchange.load_markets()
         self.orders: dict = {}
         self._order_id = 1000
         self._usdt = PAPER_BALANCE
         self._btc = 0.0
+        self._last_price = 0.0
 
     def _new_id(self) -> str:
         self._order_id += 1
         return f"paper_{self._order_id}"
 
     def load_markets(self):
-        return {}
+        return self._real_exchange.markets
 
     def fetch_ticker(self, symbol: str) -> dict:
-        self.price *= (1 + random.uniform(-0.003, 0.003))
-        return {"last": self.price, "symbol": symbol}
+        ticker = self._real_exchange.fetch_ticker(symbol)
+        self._last_price = float(ticker["last"])
+        return ticker
 
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 24) -> list:
-        price = self.price
-        data = []
-        for _ in range(limit):
-            price *= (1 + random.uniform(-0.008, 0.008))
-            data.append([0, price * 0.99, price * 1.01, price * 0.98, price, 100.0])
-        return data
+        return self._real_exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
 
     def _create_order(self, side: str, symbol: str, amount: float, price: float) -> dict:
         oid = self._new_id()
@@ -465,13 +466,11 @@ class PaperExchange:
             del self.orders[oid]
 
     def fetch_order(self, oid: str, symbol: str) -> dict:
-        # En paper trading, les ordres disparus sont toujours des fills
         return {"id": oid, "status": "closed"}
 
     def fetch_balance(self):
         base_asset = SYMBOL.split("/")[0]
         quote_asset = SYMBOL.split("/")[1]
-        # Calculer le USDT bloqué dans les ordres buy
         used_usdt = sum(o["amount"] * o["price"] for o in self.orders.values() if o["side"] == "buy")
         used_btc = sum(o["amount"] for o in self.orders.values() if o["side"] == "sell")
         return {
@@ -480,14 +479,20 @@ class PaperExchange:
         }
 
     def _simulate_fills(self):
-        """Simule les fills quand le prix croise un niveau."""
+        """Simule les fills quand le vrai prix croise un niveau."""
         filled_ids = [
             oid for oid, o in self.orders.items()
-            if (o["side"] == "buy" and self.price <= o["price"])
-            or (o["side"] == "sell" and self.price >= o["price"])
+            if (o["side"] == "buy" and self._last_price <= o["price"])
+            or (o["side"] == "sell" and self._last_price >= o["price"])
         ]
         for oid in filled_ids:
-            del self.orders[oid]
+            o = self.orders.pop(oid)
+            if o["side"] == "buy":
+                self._usdt -= o["amount"] * o["price"]
+                self._btc += o["amount"]
+            else:
+                self._btc -= o["amount"]
+                self._usdt += o["amount"] * o["price"]
 
 
 # ─── BOUCLE PRINCIPALE ────────────────────────────────────────────────────────
@@ -496,7 +501,9 @@ def status_report(state: dict) -> str:
     elapsed = "N/A"
     try:
         start = datetime.fromisoformat(state["start_time"])
-        delta = datetime.now() - start
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=TZ)
+        delta = datetime.now(TZ) - start
         h = int(delta.total_seconds() // 3600)
         m = int((delta.total_seconds() % 3600) // 60)
         elapsed = f"{h}h{m:02d}m"
@@ -528,8 +535,8 @@ def main():
     state = load_state()
 
     if PAPER_TRADING:
-        exchange = PaperExchange(base_price=87000.0)
-        log.info("📄 Paper exchange initialisé (prix simulé: 87000)")
+        exchange = PaperExchange()
+        log.info("📄 Paper exchange initialisé (prix réels via API publique)")
     else:
         try:
             exchange = init_exchange()
@@ -577,13 +584,11 @@ def main():
         place_grid(exchange, state)
     notify("✅ **Grid Bot démarré**\nSurveillance toutes les 30s.")
 
-    loop_count = 0
-    rebalance_interval = 20  # status toutes les ~10 min (20 × 30s)
+    last_report_hour = None  # Pour éviter d'envoyer le rapport 2x dans la même heure
 
     while True:
         try:
             time.sleep(30)
-            loop_count += 1
             price = get_current_price(exchange)
             state["current_price"] = price
 
@@ -597,7 +602,7 @@ def main():
                 log.error(msg)
                 notify(msg, color=0xff0000)
                 save_state(state)
-                break
+                raise SystemExit(msg)
 
             # Recentrer la grille si le prix dérive trop
             base = state.get("grid_base_price") or price
@@ -609,11 +614,15 @@ def main():
             # Mise à jour du solde
             fetch_balance(exchange, state)
 
-            # Rapport périodique
-            if loop_count % rebalance_interval == 0:
+            # Rapport Discord à 8h et 20h (heure de Paris)
+            now = datetime.now(TZ)
+            if now.hour in (8, 20) and last_report_hour != now.hour:
+                last_report_hour = now.hour
                 report = status_report(state)
                 log.info(report.replace("**", "").replace("`", ""))
                 notify(report)
+            elif now.hour not in (8, 20):
+                last_report_hour = None  # Reset pour le prochain créneau
 
             save_state(state)
 
