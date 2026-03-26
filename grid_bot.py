@@ -29,6 +29,8 @@ GRID_SPREAD     = float(os.getenv("GRID_SPREAD", 0.005))
 PRICE_RANGE_PCT = float(os.getenv("PRICE_RANGE_PCT", 0.05))
 STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", 0.08))
 MAX_OPEN_ORDERS = int(os.getenv("MAX_OPEN_ORDERS", 20))
+TAKER_FEE       = float(os.getenv("TAKER_FEE", 0.001))  # 0.1% par défaut (MEXC)
+MAX_FILLED_HISTORY = int(os.getenv("MAX_FILLED_HISTORY", 500))
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 PAPER_TRADING   = os.getenv("PAPER_TRADING", "true").lower() == "true"
 
@@ -73,8 +75,14 @@ def load_state() -> dict:
     }
 
 def save_state(state: dict):
-    with open(STATE_FILE, "w") as f:
+    # Tronquer l'historique pour éviter que le fichier grossisse indéfiniment
+    if len(state.get("filled_orders", [])) > MAX_FILLED_HISTORY:
+        state["filled_orders"] = state["filled_orders"][-MAX_FILLED_HISTORY:]
+    # Écriture atomique : temp file + rename pour éviter corruption en cas de crash
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(state, f, indent=2, default=str)
+    os.replace(tmp, STATE_FILE)
 
 # ─── DISCORD ──────────────────────────────────────────────────────────────────
 
@@ -236,6 +244,59 @@ def place_grid(exchange, state: dict):
         f"Ordres placés: `{len(placed)}` | Erreurs: `{errors}`"
     )
 
+# ─── REBALANCE (PRÉSERVE LES CONTRE-ORDRES) ──────────────────────────────────
+
+def rebalance_grid(exchange, state: dict, new_price: float):
+    """Recentre la grille en préservant les contre-ordres actifs."""
+    grid_orders = state.get("grid_orders", {})
+
+    # Séparer les contre-ordres (cycles en cours) des ordres initiaux
+    counter_orders = {oid: o for oid, o in grid_orders.items() if o.get("is_counter")}
+    initial_orders = {oid: o for oid, o in grid_orders.items() if not o.get("is_counter")}
+
+    # Annuler uniquement les ordres initiaux sur l'exchange
+    for oid in initial_orders:
+        try:
+            exchange.cancel_order(oid, SYMBOL)
+        except Exception:
+            pass
+
+    log.info(f"♻️ Rebalance: {len(initial_orders)} ordres initiaux annulés, {len(counter_orders)} contre-ordres préservés")
+
+    # Placer de nouveaux ordres initiaux autour du nouveau prix
+    state["grid_base_price"] = new_price
+    size = order_size(new_price)
+    grid = compute_grid(new_price)
+
+    new_orders = dict(counter_orders)  # Garder les contre-ordres
+    errors = 0
+    for level in grid:
+        if len(new_orders) >= MAX_OPEN_ORDERS:
+            break
+        try:
+            if level["side"] == "buy":
+                order = exchange.create_limit_buy_order(SYMBOL, size, level["price"])
+            else:
+                order = exchange.create_limit_sell_order(SYMBOL, size, level["price"])
+
+            oid = str(order.get("id", f"paper_{level['side']}_{level['index']}"))
+            new_orders[oid] = {
+                "id": oid,
+                "side": level["side"],
+                "price": level["price"],
+                "size": size,
+                "index": level["index"],
+                "placed_at": datetime.now().isoformat(),
+                "is_counter": False,
+            }
+        except Exception as e:
+            log.warning(f"  ❌ Erreur {level['side']} @ {level['price']:.2f}: {e}")
+            errors += 1
+
+    state["grid_orders"] = new_orders
+    save_state(state)
+    log.info(f"📐 Rebalance terminée @ {new_price:.2f} | {len(new_orders)} ordres actifs (dont {len(counter_orders)} contre-ordres)")
+
 # ─── DÉTECTION DES FILLS (LIVE) ───────────────────────────────────────────────
 
 def check_fills_live(exchange, state: dict):
@@ -259,20 +320,24 @@ def check_fills_live(exchange, state: dict):
         side = order["side"]
         is_counter = order.get("is_counter", False)
 
+        # Frais sur chaque fill (buy ou sell)
+        fee = fill_price * size * TAKER_FEE
         # Profit uniquement sur les contre-ordres (cycle buy+sell complété)
-        profit = 0.0
+        profit = -fee
         if is_counter:
-            profit = fill_price * GRID_SPREAD * size
-            state["total_profit"] += profit
+            # Profit du cycle = spread - frais des 2 fills (ce fill + le fill initial)
+            gross = fill_price * GRID_SPREAD * size
+            profit = gross - 2 * fee
+        state["total_profit"] += profit
         state["total_trades"] += 1
 
         fill_record = {**order, "fill_time": datetime.now().isoformat(), "profit": profit}
         state["filled_orders"].append(fill_record)
 
         if is_counter:
-            log.info(f"💰 FILL {side.upper()} @ {fill_price:.2f} | +{profit:.4f} USDT (cycle complété)")
+            log.info(f"💰 FILL {side.upper()} @ {fill_price:.2f} | +{profit:.4f} USDT net (cycle complété, frais: {2*fee:.4f})")
         else:
-            log.info(f"📥 FILL {side.upper()} @ {fill_price:.2f} | ordre initial (pas encore de profit)")
+            log.info(f"📥 FILL {side.upper()} @ {fill_price:.2f} | ordre initial (frais: {fee:.4f})")
 
         # Placer le contre-ordre
         try:
@@ -349,7 +414,7 @@ class PaperExchange:
 
     def cancel_order(self, oid: str, symbol: str):
         if oid in self.orders:
-            self.orders[oid]["status"] = "canceled"
+            del self.orders[oid]
 
     def fetch_balance(self):
         base_asset = SYMBOL.split("/")[0]
@@ -361,13 +426,17 @@ class PaperExchange:
 
     def _simulate_fills(self):
         """Simule des fills aléatoires sur les ordres ouverts."""
-        for order in self.orders.values():
+        filled_ids = []
+        for oid, order in self.orders.items():
             if order["status"] != "open":
                 continue
             if order["side"] == "buy" and self.price <= order["price"]:
-                order["status"] = "filled"
+                filled_ids.append(oid)
             elif order["side"] == "sell" and self.price >= order["price"]:
-                order["status"] = "filled"
+                filled_ids.append(oid)
+        # Retirer les ordres remplis (seuls les open restent)
+        for oid in filled_ids:
+            del self.orders[oid]
 
 
 # ─── BOUCLE PRINCIPALE ────────────────────────────────────────────────────────
@@ -418,8 +487,25 @@ def main():
     vol = get_volatility(exchange)
     log.info(f"📈 Volatilité 1h/24h: {vol:.3f}% — {'🔥 Favorable' if vol > 0.5 else '😴 Faible'}")
 
-    # Placer la grille initiale
-    place_grid(exchange, state)
+    # Reprise ou placement initial de la grille
+    if state.get("grid_orders") and state.get("grid_base_price"):
+        log.info(f"♻️ Reprise de la grille existante ({len(state['grid_orders'])} ordres, base: {state['grid_base_price']:.2f})")
+        # Vérifier que les ordres existent encore sur l'exchange
+        try:
+            open_ids = {str(o["id"]) for o in exchange.fetch_open_orders(SYMBOL)}
+            orphans = [oid for oid in state["grid_orders"] if oid not in open_ids]
+            if orphans:
+                log.warning(f"⚠️ {len(orphans)} ordres orphelins détectés (plus sur l'exchange)")
+                for oid in orphans:
+                    del state["grid_orders"][oid]
+            if not state["grid_orders"]:
+                log.info("🔄 Aucun ordre valide restant — replaçement de la grille")
+                place_grid(exchange, state)
+        except Exception as e:
+            log.warning(f"Impossible de vérifier les ordres existants: {e} — replaçement")
+            place_grid(exchange, state)
+    else:
+        place_grid(exchange, state)
     notify("✅ **Grid Bot démarré**\nSurveillance toutes les 30s.")
 
     loop_count = 0
@@ -448,7 +534,7 @@ def main():
             drift = abs(price - base) / base
             if drift > PRICE_RANGE_PCT:
                 log.info(f"🔄 Drift {drift*100:.1f}% > {PRICE_RANGE_PCT*100:.0f}% — recentrage de la grille")
-                place_grid(exchange, state)
+                rebalance_grid(exchange, state, price)
 
             # Mise à jour du solde
             fetch_balance(exchange, state)
