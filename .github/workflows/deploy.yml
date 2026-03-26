@@ -1,0 +1,112 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    name: Build & Push to GHCR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to Server
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: production
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          script: |
+            set -e
+
+            # Login GHCR
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # Pull la dernière image
+            docker pull ghcr.io/${{ github.repository }}:latest
+
+            # Aller dans le dossier du projet (créer si besoin)
+            mkdir -p ~/trading-grid
+            cd ~/trading-grid
+
+            # Récupérer le docker-compose depuis le repo si pas présent
+            if [ ! -f docker-compose.yml ]; then
+              curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/docker-compose.yml -o docker-compose.yml
+            fi
+
+            # Mettre à jour docker-compose pour utiliser l'image du registry
+            # (pas de build local — on utilise l'image pre-built)
+            cat > docker-compose.prod.yml << 'EOF'
+            services:
+              grid-bot:
+                image: ghcr.io/${{ github.repository }}:latest
+                container_name: trading-grid-bot
+                restart: unless-stopped
+                env_file:
+                  - .env
+                volumes:
+                  - ./data:/app/data
+                environment:
+                  - STATE_FILE=/app/data/bot_state.json
+                logging:
+                  driver: "json-file"
+                  options:
+                    max-size: "10m"
+                    max-file: "3"
+            EOF
+
+            # Déployer (zero-downtime: pull → up → remove old)
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+
+            # Cleanup images inutilisées
+            docker image prune -f
+
+            echo "✅ Deploy terminé — $(date)"
