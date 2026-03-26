@@ -65,17 +65,20 @@ def build_header(state: dict) -> Panel:
     base_price = state.get("grid_base_price") or 0
     drift = abs(price - base_price) / base_price * 100 if base_price else 0
     elapsed = format_elapsed(state.get("start_time", ""))
-    profit = state.get("total_profit", 0)
+    grid_profit = state.get("total_profit", 0)
     trades = state.get("total_trades", 0)
     start_val = state.get("start_portfolio_value") or 1
-    roi = profit / start_val * 100
     active = len(state.get("grid_orders", {}))
     portfolio = state.get("portfolio_value", 0)
     capital = state.get("effective_capital", 0)
     alloc = state.get("capital_allocation", 0)
 
-    profit_color = "green" if profit >= 0 else "red"
-    roi_color = "green" if roi >= 0 else "red"
+    # PnL portefeuille (valeur reelle)
+    portfolio_pnl = portfolio - start_val
+    portfolio_roi = (portfolio_pnl / start_val * 100) if start_val else 0
+
+    pnl_color = "green" if portfolio_pnl >= 0 else "red"
+    grid_color = "green" if grid_profit >= 0 else "red"
 
     header = Text()
     header.append(f"  {SYMBOL}", style="bold cyan")
@@ -86,10 +89,12 @@ def build_header(state: dict) -> Panel:
     header.append(f"  |  Drift: ", style="dim")
     drift_style = "yellow" if drift > 3 else "green"
     header.append(f"{drift:.2f}%", style=drift_style)
-    header.append(f"\n  Profit: ", style="dim")
-    header.append(f"{profit:+.4f} USDT", style=f"bold {profit_color}")
+    header.append(f"\n  PnL: ", style="dim")
+    header.append(f"{portfolio_pnl:+.2f} USDT", style=f"bold {pnl_color}")
     header.append(f"  |  ROI: ", style="dim")
-    header.append(f"{roi:+.2f}%", style=f"bold {roi_color}")
+    header.append(f"{portfolio_roi:+.2f}%", style=f"bold {pnl_color}")
+    header.append(f"  |  Grid profit: ", style="dim")
+    header.append(f"{grid_profit:+.4f}", style=grid_color)
     header.append(f"  |  Trades: ", style="dim")
     header.append(f"{trades}", style="bold white")
     header.append(f"  |  Ordres: ", style="dim")

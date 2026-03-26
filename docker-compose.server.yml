@@ -5,6 +5,7 @@ services:
     image: registry.saillardq.fr/trading-grid:latest
     container_name: trading-grid-bot
     restart: unless-stopped
+    stop_grace_period: 30s
     env_file:
       - .env
     volumes:
