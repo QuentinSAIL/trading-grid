@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY grid_bot.py .
+COPY grid_bot.py dashboard.py backtest.py ./
 
 # Dossier pour persister logs et state
 VOLUME ["/app/data"]

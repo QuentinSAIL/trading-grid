@@ -12,7 +12,7 @@ import time
 import json
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -28,6 +28,7 @@ GRID_LEVELS     = int(os.getenv("GRID_LEVELS", 10))
 GRID_SPREAD     = float(os.getenv("GRID_SPREAD", 0.005))
 PRICE_RANGE_PCT = float(os.getenv("PRICE_RANGE_PCT", 0.05))
 STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", 0.08))
+MAX_OPEN_ORDERS = int(os.getenv("MAX_OPEN_ORDERS", 20))
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 PAPER_TRADING   = os.getenv("PAPER_TRADING", "true").lower() == "true"
 
@@ -67,6 +68,8 @@ def load_state() -> dict:
         "start_capital": CAPITAL,
         "start_time": datetime.now().isoformat(),
         "grid_base_price": None,
+        "current_price": None,
+        "balance": {},           # {asset: {free, used, total}} from exchange
     }
 
 def save_state(state: dict):
@@ -84,7 +87,7 @@ def notify(message: str, color: int = 0x00ff88):
                 "description": message,
                 "color": color,
                 "footer": {"text": f"Grid Bot | {SYMBOL} | {'📄 PAPER' if PAPER_TRADING else '🔴 LIVE'}"},
-                "timestamp": datetime.utcnow().isoformat() + "Z"
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }]
         }
         r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=5)
@@ -106,6 +109,29 @@ def init_exchange() -> ccxt.Exchange:
     exchange.load_markets()
     log.info(f"✅ Connecté à {EXCHANGE_ID.upper()} — {SYMBOL} disponible: {SYMBOL in exchange.markets}")
     return exchange
+
+# ─── BALANCE ─────────────────────────────────────────────────────────────────
+
+def fetch_balance(exchange, state: dict):
+    """Récupère le solde USDT et l'asset tradé depuis l'exchange."""
+    try:
+        base_asset = SYMBOL.split("/")[0]   # ex: BTC
+        quote_asset = SYMBOL.split("/")[1]  # ex: USDT
+        balance = exchange.fetch_balance()
+        state["balance"] = {
+            quote_asset: {
+                "free": float(balance.get(quote_asset, {}).get("free", 0) or 0),
+                "used": float(balance.get(quote_asset, {}).get("used", 0) or 0),
+                "total": float(balance.get(quote_asset, {}).get("total", 0) or 0),
+            },
+            base_asset: {
+                "free": float(balance.get(base_asset, {}).get("free", 0) or 0),
+                "used": float(balance.get(base_asset, {}).get("used", 0) or 0),
+                "total": float(balance.get(base_asset, {}).get("total", 0) or 0),
+            },
+        }
+    except Exception as e:
+        log.warning(f"Impossible de récupérer le solde: {e}")
 
 # ─── PRIX & VOLATILITÉ ────────────────────────────────────────────────────────
 
@@ -176,6 +202,9 @@ def place_grid(exchange, state: dict):
     placed = {}
     errors = 0
     for level in grid:
+        if len(placed) >= MAX_OPEN_ORDERS:
+            log.warning(f"⚠️ Limite MAX_OPEN_ORDERS ({MAX_OPEN_ORDERS}) atteinte")
+            break
         try:
             if level["side"] == "buy":
                 order = exchange.create_limit_buy_order(SYMBOL, size, level["price"])
@@ -189,7 +218,8 @@ def place_grid(exchange, state: dict):
                 "price": level["price"],
                 "size": size,
                 "index": level["index"],
-                "placed_at": datetime.now().isoformat()
+                "placed_at": datetime.now().isoformat(),
+                "is_counter": False,
             }
             log.info(f"  ✅ {level['side'].upper()} @ {level['price']:.2f}")
         except Exception as e:
@@ -227,27 +257,29 @@ def check_fills_live(exchange, state: dict):
         fill_price = order["price"]
         size = order["size"]
         side = order["side"]
+        is_counter = order.get("is_counter", False)
 
-        # Profit = spread × taille en USDT (un cycle buy+sell complet)
-        profit_per_cycle = fill_price * GRID_SPREAD * size
-        # On comptabilise la moitié à chaque fill (buy + sell = 1 cycle)
-        state["total_profit"] += profit_per_cycle / 2
+        # Profit uniquement sur les contre-ordres (cycle buy+sell complété)
+        profit = 0.0
+        if is_counter:
+            profit = fill_price * GRID_SPREAD * size
+            state["total_profit"] += profit
         state["total_trades"] += 1
 
-        fill_record = {**order, "fill_time": datetime.now().isoformat(), "profit": profit_per_cycle / 2}
+        fill_record = {**order, "fill_time": datetime.now().isoformat(), "profit": profit}
         state["filled_orders"].append(fill_record)
 
-        log.info(f"💰 FILL {side.upper()} @ {fill_price:.2f} | +{profit_per_cycle/2:.4f} USDT")
+        if is_counter:
+            log.info(f"💰 FILL {side.upper()} @ {fill_price:.2f} | +{profit:.4f} USDT (cycle complété)")
+        else:
+            log.info(f"📥 FILL {side.upper()} @ {fill_price:.2f} | ordre initial (pas encore de profit)")
 
         # Placer le contre-ordre
         try:
-            base = state["grid_base_price"]
             if side == "buy":
-                # Un buy s'est rempli → placer un sell un niveau au-dessus
                 counter_price = round(fill_price * (1 + GRID_SPREAD), 2)
                 new_order = exchange.create_limit_sell_order(SYMBOL, size, counter_price)
             else:
-                # Un sell s'est rempli → placer un buy un niveau en-dessous
                 counter_price = round(fill_price * (1 - GRID_SPREAD), 2)
                 new_order = exchange.create_limit_buy_order(SYMBOL, size, counter_price)
 
@@ -258,7 +290,8 @@ def check_fills_live(exchange, state: dict):
                 "price": counter_price,
                 "size": size,
                 "index": order.get("index", 0),
-                "placed_at": datetime.now().isoformat()
+                "placed_at": datetime.now().isoformat(),
+                "is_counter": True,
             }
             log.info(f"  ↩️ Contre-ordre {'SELL' if side == 'buy' else 'BUY'} @ {counter_price:.2f}")
         except Exception as e:
@@ -317,6 +350,14 @@ class PaperExchange:
     def cancel_order(self, oid: str, symbol: str):
         if oid in self.orders:
             self.orders[oid]["status"] = "canceled"
+
+    def fetch_balance(self):
+        base_asset = SYMBOL.split("/")[0]
+        quote_asset = SYMBOL.split("/")[1]
+        return {
+            quote_asset: {"free": CAPITAL * 0.5, "used": CAPITAL * 0.5, "total": CAPITAL},
+            base_asset: {"free": 0.001, "used": 0.001, "total": 0.002},
+        }
 
     def _simulate_fills(self):
         """Simule des fills aléatoires sur les ordres ouverts."""
@@ -389,6 +430,7 @@ def main():
             time.sleep(30)
             loop_count += 1
             price = get_current_price(exchange)
+            state["current_price"] = price
 
             # Détecter les fills et placer les contre-ordres
             check_fills_live(exchange, state)
@@ -407,6 +449,9 @@ def main():
             if drift > PRICE_RANGE_PCT:
                 log.info(f"🔄 Drift {drift*100:.1f}% > {PRICE_RANGE_PCT*100:.0f}% — recentrage de la grille")
                 place_grid(exchange, state)
+
+            # Mise à jour du solde
+            fetch_balance(exchange, state)
 
             # Rapport périodique
             if loop_count % rebalance_interval == 0:
