@@ -50,7 +50,7 @@ def parse_args():
     parser.add_argument("--range-pct", type=float,
                         default=float(os.getenv("PRICE_RANGE_PCT", 0.03)))
     parser.add_argument("--stop-loss", type=float,
-                        default=float(os.getenv("STOP_LOSS_PCT", 0.25)))
+                        default=float(os.getenv("STOP_LOSS_PCT", 0.50)))
     parser.add_argument("--maker-fee", type=float,
                         default=float(os.getenv("MAKER_FEE", 0.0)),
                         help="Frais maker (defaut: 0%% MEXC)")
@@ -59,6 +59,12 @@ def parse_args():
                         help="Frais taker (defaut: 0.1%% MEXC)")
     parser.add_argument("--timeframe", default="1h",
                         help="Timeframe des bougies (defaut: 1h)")
+    parser.add_argument("--grid-type", default="geometric",
+                        choices=["linear", "geometric"],
+                        help="Type de grille (defaut: geometric)")
+    parser.add_argument("--weight-factor", type=float, default=1.5,
+                        help="Ponderation aux extremes: "
+                             "0=egal, 1=double, 2=triple (defaut: 1.5)")
     return parser.parse_args()
 
 
@@ -99,7 +105,8 @@ def fetch_candles(exchange, symbol: str, timeframe: str,
 
 class GridBacktester:
     def __init__(self, capital, levels, spread, range_pct,
-                 stop_loss_pct, maker_fee, taker_fee):
+                 stop_loss_pct, maker_fee, taker_fee,
+                 grid_type="linear", weight_factor=0.0):
         self.initial_capital = capital
         self.capital = capital    # USDT disponible
         self.levels = levels
@@ -109,6 +116,8 @@ class GridBacktester:
         self.stop_loss_pct = stop_loss_pct
         self.maker_fee = maker_fee
         self.taker_fee = taker_fee
+        self.grid_type = grid_type        # "linear" ou "geometric"
+        self.weight_factor = weight_factor  # 0=egal, 1=double aux extremes, 2=triple
 
         self.grid_orders = {}
         self.btc_held = 0.0       # BTC detenu (pour tracking inventaire)
@@ -124,14 +133,16 @@ class GridBacktester:
         self.stopped = False
         self._oid = 0
 
-        # Volatilite dynamique
+        # Volatilite dynamique — FLOOR = base_spread (jamais en dessous)
         self.closes_history = []
         self.volatility_window = 24
-        self.min_spread = spread * 0.5
         self.max_spread = spread * 4.0
 
         # Stats supplementaires
         self.rebalance_count = 0
+
+        # Demarrage 50/50 pour capter la tendance
+        self._needs_initial_split = True
 
     def _new_id(self) -> str:
         self._oid += 1
@@ -149,13 +160,15 @@ class GridBacktester:
         return math.sqrt(variance)
 
     def _update_dynamic_spread(self):
-        """Ajuste le spread selon la volatilite recente."""
+        """Ajuste le spread selon la volatilite recente.
+        PLANCHER = base_spread (jamais en dessous)."""
         if len(self.closes_history) < 3:
             return
         vol = self._calculate_volatility()
-        # Spread cible = 2.5x la volatilite horaire (capture le mouvement)
+        # Spread cible = 2.5x la volatilite horaire
         target = vol * 2.5
-        target = max(self.min_spread, min(self.max_spread, target))
+        # FLOOR = base_spread, CEIL = max_spread
+        target = max(self.base_spread, min(self.max_spread, target))
         # Lissage pour eviter les changements brusques
         self.spread = self.spread * 0.7 + target * 0.3
 
@@ -164,38 +177,66 @@ class GridBacktester:
         portfolio = self.capital + self.btc_held * price
         if portfolio <= 0:
             return 0.5
-        return (self.btc_held * price) / portfolio
+        return max(0.0, (self.btc_held * price) / portfolio)
 
-    def order_size(self, base_price: float, side: str) -> float:
-        """Taille par niveau avec gestion d'inventaire.
-        Reduit les achats quand trop de BTC, et inversement."""
+    def _grid_price(self, base_price: float, i: int, side: str) -> float:
+        """Prix de la grille au niveau i selon le type."""
+        if self.grid_type == "geometric":
+            if side == "buy":
+                return base_price * (1 - self.spread) ** i
+            else:
+                return base_price * (1 + self.spread) ** i
+        else:  # linear
+            if side == "buy":
+                return base_price * (1 - i * self.spread)
+            else:
+                return base_price * (1 + i * self.spread)
+
+    def _weighted_multiplier(self, i: int) -> float:
+        """Multiplicateur de taille au niveau i.
+        i=1 (proche du prix) -> 1x, i=levels (loin) -> (1+weight_factor)x
+        Plus weight_factor est eleve, plus les ordres loin du prix sont gros.
+        = DCA agressif sur les buys, prise de profit agressive sur les sells."""
+        if self.levels <= 1 or self.weight_factor == 0:
+            return 1.0
+        progress = (i - 1) / (self.levels - 1)  # 0 a 1
+        return 1.0 + self.weight_factor * progress
+
+    def order_size(self, base_price: float, side: str,
+                   level: int = 1) -> float:
+        """Taille par niveau avec gestion d'inventaire + ponderation."""
         portfolio_value = self.capital + self.btc_held * base_price
-        effective = portfolio_value * 0.9  # 90% allocation
-        base_size_usdt = (effective / 2) / self.levels
+        effective = portfolio_value * 0.9
+
+        # Normaliser la taille de base pour que la somme ponderee
+        # des ordres utilise ~50% du capital par cote
+        total_weight = sum(self._weighted_multiplier(i)
+                           for i in range(1, self.levels + 1))
+        base_size_usdt = (effective / 2) / total_weight
+
+        # Appliquer le poids du niveau
+        base_size_usdt *= self._weighted_multiplier(level)
 
         inv_ratio = self._inventory_ratio(base_price)
 
         if side == "buy":
-            # Trop de BTC -> reduire les achats
-            if inv_ratio > 0.5:
-                factor = max(0.2, 1.0 - (inv_ratio - 0.5) * 3)
+            if inv_ratio > 0.6:
+                factor = max(0.1, 1.0 - (inv_ratio - 0.5) * 2)
                 base_size_usdt *= factor
         else:
-            # Trop de BTC -> augmenter les ventes
-            if inv_ratio > 0.5:
-                factor = min(1.8, 1.0 + (inv_ratio - 0.5) * 2)
+            if inv_ratio > 0.6:
+                factor = min(2.0, 1.0 + (inv_ratio - 0.5) * 2)
                 base_size_usdt *= factor
-            # Pas assez de BTC -> reduire les ventes
-            elif inv_ratio < 0.2:
-                factor = max(0.3, inv_ratio / 0.4)
+            elif inv_ratio < 0.3:
+                factor = max(0.2, inv_ratio / 0.5)
                 base_size_usdt *= factor
 
         return base_size_usdt / base_price
 
     def place_grid(self, price: float, timestamp: int):
-        """Place la grille avec spread dynamique et sizing inventaire-aware.
+        """Place la grille avec spread dynamique, spacing geometrique/lineaire,
+        sizing pondere et inventaire-aware.
         Preserve les contre-ordres existants."""
-        # Sauvegarder les contre-ordres
         counter_orders = {oid: o for oid, o in self.grid_orders.items()
                           if o.get("is_counter")}
         self.grid_orders = dict(counter_orders)
@@ -205,11 +246,10 @@ class GridBacktester:
         base_used = 0.0
 
         for i in range(1, self.levels + 1):
-            # Buy orders (si assez de USDT cumulativement)
-            buy_size = self.order_size(price, "buy")
-            buy_price = price * (1 - i * self.spread)
+            buy_size = self.order_size(price, "buy", i)
+            buy_price = self._grid_price(price, i, "buy")
             buy_cost = buy_size * buy_price
-            if quote_used + buy_cost <= self.capital:
+            if buy_cost > 0 and quote_used + buy_cost <= self.capital:
                 buy_id = self._new_id()
                 self.grid_orders[buy_id] = {
                     "side": "buy",
@@ -219,10 +259,9 @@ class GridBacktester:
                 }
                 quote_used += buy_cost
 
-            # Sell orders (si assez de BTC cumulativement)
-            sell_size = self.order_size(price, "sell")
-            sell_price = price * (1 + i * self.spread)
-            if base_used + sell_size <= self.btc_held:
+            sell_size = self.order_size(price, "sell", i)
+            sell_price = self._grid_price(price, i, "sell")
+            if sell_size > 0 and base_used + sell_size <= self.btc_held:
                 sell_id = self._new_id()
                 self.grid_orders[sell_id] = {
                     "side": "sell",
@@ -242,6 +281,13 @@ class GridBacktester:
         self.closes_history.append(c)
         self._update_dynamic_spread()
 
+        # Demarrage 50/50: acheter du BTC avec la moitie du capital
+        if self._needs_initial_split:
+            btc_to_buy = (self.capital * 0.5) / o
+            self.capital -= btc_to_buy * o
+            self.btc_held += btc_to_buy
+            self._needs_initial_split = False
+
         if self.grid_base_price is None:
             self.place_grid(o, ts)
 
@@ -260,10 +306,22 @@ class GridBacktester:
             side = order["side"]
             is_counter = order["is_counter"]
 
+            # Protection: ne jamais vendre plus de BTC qu'on en a
+            if side == "sell" and size > self.btc_held:
+                if self.btc_held <= 0:
+                    continue  # skip ce fill
+                size = self.btc_held  # vendre ce qu'on a
+
+            # Protection: ne jamais acheter plus qu'on ne peut payer
+            cost = fill_price * size
+            if side == "buy" and cost > self.capital:
+                if self.capital <= 0:
+                    continue
+                size = self.capital / fill_price
+
             fee = fill_price * size * self.maker_fee
             self.total_fees += fee
 
-            # Mettre a jour l'inventaire
             if side == "buy":
                 self.capital -= fill_price * size
                 self.btc_held += size
@@ -326,16 +384,14 @@ class GridBacktester:
             self.stopped = True
             return
 
-        # Trailing grid base: glisse progressivement vers le prix actuel
+        # Trailing grid base + recentrage
         if self.grid_base_price:
             drift = abs(c - self.grid_base_price) / self.grid_base_price
 
-            # Micro-ajustement continu: deplace la base de 10% vers le prix
             if drift > 0.005:
                 self.grid_base_price = (self.grid_base_price * 0.9
                                         + c * 0.1)
 
-            # Recentrage complet si drift trop important
             if drift > self.range_pct:
                 self.rebalance_count += 1
                 self.place_grid(c, ts)
@@ -367,6 +423,8 @@ def display_results(bt: GridBacktester, candles: list, args):
     config.add_row("Spread",
                    f"{bt.base_spread * 100:.2f}% base → "
                    f"{bt.spread * 100:.2f}% final (dynamique)")
+    config.add_row("Grille",
+                   f"{bt.grid_type} | poids: {bt.weight_factor}x aux extremes")
     config.add_row("Frais",
                    f"maker {bt.maker_fee * 100:.2f}% / "
                    f"taker {bt.taker_fee * 100:.2f}%")
@@ -516,6 +574,8 @@ def main():
         stop_loss_pct=args.stop_loss,
         maker_fee=args.maker_fee,
         taker_fee=args.taker_fee,
+        grid_type=args.grid_type,
+        weight_factor=args.weight_factor,
     )
 
     with Progress(console=console) as progress:

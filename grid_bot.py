@@ -30,8 +30,8 @@ API_SECRET      = os.getenv("API_SECRET", "")
 SYMBOL          = os.getenv("SYMBOL", "BTC/USDT")
 CAPITAL_ALLOC   = float(os.getenv("CAPITAL_ALLOCATION", 90))  # % du portefeuille
 MIN_CAPITAL     = float(os.getenv("MIN_CAPITAL", 30))         # minimum USDT pour trader
-GRID_LEVELS     = int(os.getenv("GRID_LEVELS", 10))
-GRID_SPREAD     = float(os.getenv("GRID_SPREAD", 0.005))
+GRID_LEVELS     = int(os.getenv("GRID_LEVELS", 8))
+GRID_SPREAD     = float(os.getenv("GRID_SPREAD", 0.003))
 PRICE_RANGE_PCT = float(os.getenv("PRICE_RANGE_PCT", 0.03))
 STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", 0.25))
 MAX_OPEN_ORDERS = int(os.getenv("MAX_OPEN_ORDERS", 20))
@@ -234,19 +234,38 @@ def adapt_spread(exchange) -> float:
     return max(min_spread, min(max_spread, target))
 
 
+GRID_TYPE       = os.getenv("GRID_TYPE", "geometric")       # "linear" ou "geometric"
+WEIGHT_FACTOR   = float(os.getenv("WEIGHT_FACTOR", 3.0))    # 0=egal, 3=4x aux extremes
+
+
+def _weight_multiplier(level: int) -> float:
+    """Multiplicateur de taille au niveau i.
+    Plus le level est loin du prix, plus l'ordre est gros (DCA)."""
+    if GRID_LEVELS <= 1 or WEIGHT_FACTOR == 0:
+        return 1.0
+    progress = (level - 1) / (GRID_LEVELS - 1)
+    return 1.0 + WEIGHT_FACTOR * progress
+
+
 def compute_grid(base_price: float, exchange,
                  spread: float = None) -> list:
-    """Genere les niveaux buy/sell autour du prix de base."""
+    """Genere les niveaux buy/sell (geometrique + ponderes)."""
     s = spread or GRID_SPREAD
     levels = []
     for i in range(1, GRID_LEVELS + 1):
+        if GRID_TYPE == "geometric":
+            buy_price = base_price * (1 - s) ** i
+            sell_price = base_price * (1 + s) ** i
+        else:
+            buy_price = base_price * (1 - i * s)
+            sell_price = base_price * (1 + i * s)
         levels.append({
-            "price": round_price(exchange, base_price * (1 - i * s)),
+            "price": round_price(exchange, buy_price),
             "side": "buy",
             "index": i
         })
         levels.append({
-            "price": round_price(exchange, base_price * (1 + i * s)),
+            "price": round_price(exchange, sell_price),
             "side": "sell",
             "index": i
         })
@@ -266,17 +285,21 @@ def inventory_ratio(state: dict, price: float) -> float:
 
 
 def order_size(base_price: float, capital: float, exchange,
-               side: str = "buy", inv_ratio: float = 0.5) -> float:
-    """Taille d'ordre par niveau avec gestion d'inventaire."""
-    base_size_usdt = (capital / 2) / GRID_LEVELS
+               side: str = "buy", inv_ratio: float = 0.5,
+               level: int = 1) -> float:
+    """Taille d'ordre par niveau avec gestion d'inventaire + ponderation."""
+    total_weight = sum(_weight_multiplier(i)
+                       for i in range(1, GRID_LEVELS + 1))
+    base_size_usdt = (capital / 2) / total_weight
+    base_size_usdt *= _weight_multiplier(level)
 
     if side == "buy":
-        if inv_ratio > 0.5:
-            factor = max(0.2, 1.0 - (inv_ratio - 0.5) * 3)
+        if inv_ratio > 0.6:
+            factor = max(0.1, 1.0 - (inv_ratio - 0.5) * 2)
             base_size_usdt *= factor
     else:
-        if inv_ratio > 0.5:
-            factor = min(1.8, 1.0 + (inv_ratio - 0.5) * 2)
+        if inv_ratio > 0.6:
+            factor = min(2.0, 1.0 + (inv_ratio - 0.5) * 2)
             base_size_usdt *= factor
         elif inv_ratio < 0.2:
             factor = max(0.3, inv_ratio / 0.4)
@@ -440,13 +463,13 @@ def place_grid(exchange, state: dict, market_info: dict):
     current_spread = adapt_spread(exchange)
 
     inv_r = inventory_ratio(state, price)
-    buy_size = order_size(price, capital, exchange, "buy", inv_r)
-    sell_size = order_size(price, capital, exchange, "sell", inv_r)
     min_amount = market_info.get("min_amount", 0)
     min_cost = market_info.get("min_cost", 0)
 
-    if buy_size < min_amount or (buy_size * price) < min_cost:
-        msg = (f"Taille d'ordre trop petite: {buy_size} "
+    # Verifier taille minimale avec le plus petit niveau
+    min_size = order_size(price, capital, exchange, "buy", inv_r, 1)
+    if min_size < min_amount or (min_size * price) < min_cost:
+        msg = (f"Taille d'ordre trop petite: {min_size} "
                f"(min amount: {min_amount}, min cost: {min_cost} USDT) "
                f"— augmenter le capital")
         log.error(msg)
@@ -457,7 +480,8 @@ def place_grid(exchange, state: dict, market_info: dict):
 
     log.info(f"Grille @ {price:.2f} | Capital: {capital:.2f} USDT "
              f"({CAPITAL_ALLOC:.0f}% de {state.get('portfolio_value', 0):.2f}) "
-             f"| spread: {current_spread*100:.2f}% | inv: {inv_r*100:.0f}%")
+             f"| spread: {current_spread*100:.2f}% | inv: {inv_r*100:.0f}% "
+             f"| {GRID_TYPE} w={WEIGHT_FACTOR}")
     log.info(f"Solde libre: {available_quote:.2f} {quote_asset} | "
              f"{available_base:.6f} {base_asset}")
 
@@ -471,7 +495,9 @@ def place_grid(exchange, state: dict, market_info: dict):
             log.warning(f"Limite MAX_OPEN_ORDERS ({MAX_OPEN_ORDERS}) atteinte")
             break
         try:
-            size = buy_size if level["side"] == "buy" else sell_size
+            lvl = level["index"]
+            size = order_size(price, capital, exchange,
+                              level["side"], inv_r, lvl)
             if level["side"] == "buy":
                 cost = size * level["price"]
                 if quote_used + cost > available_quote:
@@ -618,8 +644,6 @@ def rebalance_grid(exchange, state: dict, new_price: float, market_info: dict):
 
     current_spread = adapt_spread(exchange)
     inv_r = inventory_ratio(state, new_price)
-    buy_size = order_size(new_price, capital, exchange, "buy", inv_r)
-    sell_size = order_size(new_price, capital, exchange, "sell", inv_r)
     grid = compute_grid(new_price, exchange, current_spread)
 
     new_orders = dict(counter_orders)
@@ -631,7 +655,9 @@ def rebalance_grid(exchange, state: dict, new_price: float, market_info: dict):
         if len(new_orders) >= MAX_OPEN_ORDERS:
             break
         try:
-            size = buy_size if level["side"] == "buy" else sell_size
+            lvl = level["index"]
+            size = order_size(new_price, capital, exchange,
+                              level["side"], inv_r, lvl)
             if level["side"] == "buy":
                 cost = size * level["price"]
                 if quote_used + cost > available_quote:
