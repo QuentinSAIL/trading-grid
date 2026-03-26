@@ -1,6 +1,6 @@
 services:
   grid-bot:
-    build: .
+    image: ${REGISTRY_URL}/trading-grid:latest
     container_name: trading-grid-bot
     restart: unless-stopped
     env_file:
