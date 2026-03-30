@@ -33,13 +33,22 @@ MIN_CAPITAL     = float(os.getenv("MIN_CAPITAL", 30))         # minimum USDT pou
 GRID_LEVELS     = int(os.getenv("GRID_LEVELS", 8))
 GRID_SPREAD     = float(os.getenv("GRID_SPREAD", 0.003))
 PRICE_RANGE_PCT = float(os.getenv("PRICE_RANGE_PCT", 0.03))
-STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", 0.25))
+STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", 0.50))
 MAX_OPEN_ORDERS = int(os.getenv("MAX_OPEN_ORDERS", 20))
 MAKER_FEE       = float(os.getenv("MAKER_FEE", 0.0))    # 0% maker (MEXC)
 TAKER_FEE       = float(os.getenv("TAKER_FEE", 0.001))   # 0.1% taker (MEXC)
 MAX_FILLED_HISTORY = int(os.getenv("MAX_FILLED_HISTORY", 500))
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 PAPER_TRADING   = os.getenv("PAPER_TRADING", "true").lower() == "true"
+
+# Nouvelles features
+STALE_HOURS       = int(os.getenv("STALE_HOURS", 0))           # 0=off
+DECAY_PER_HOUR    = float(os.getenv("DECAY_PER_HOUR", 0.0002))
+TREND_SPREAD_MULT = float(os.getenv("TREND_SPREAD_MULT", 0.0)) # 0=off
+DD_THRESHOLD      = float(os.getenv("DD_THRESHOLD", 1.0))       # 1.0=off
+DD_FACTOR         = float(os.getenv("DD_FACTOR", 0.5))
+MAX_INV_RATIO     = float(os.getenv("MAX_INV_RATIO", 1.0))      # 1.0=off
+FEAR_GREED_ENABLED = os.getenv("FEAR_GREED_ENABLED", "false").lower() == "true"
 
 DATA_DIR   = os.path.dirname(os.getenv("STATE_FILE", "/app/data/bot_state.json"))
 STATE_FILE = os.getenv("STATE_FILE", "/app/data/bot_state.json")
@@ -223,19 +232,209 @@ def get_volatility(exchange) -> float:
 
 # --- GRILLE ----------------------------------------------------------------------
 
+def get_rsi(exchange) -> float:
+    """Calcule le RSI sur les dernieres bougies 1h."""
+    try:
+        ohlcv = exchange.fetch_ohlcv(SYMBOL, "1h", limit=RSI_PERIOD + 2)
+        closes = [c[4] for c in ohlcv]
+        if len(closes) < RSI_PERIOD + 1:
+            return 50.0
+        gains = []
+        losses = []
+        for i in range(1, len(closes)):
+            d = closes[i] - closes[i - 1]
+            gains.append(max(0, d))
+            losses.append(max(0, -d))
+        avg_gain = sum(gains[-RSI_PERIOD:]) / RSI_PERIOD
+        avg_loss = sum(losses[-RSI_PERIOD:]) / RSI_PERIOD
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+    except Exception as e:
+        log.warning(f"Impossible de calculer le RSI: {e}")
+        return 50.0
+
+
+def rsi_multiplier(rsi: float, side: str) -> float:
+    """Multiplicateur RSI: boost buys en survendu, sells en surachete."""
+    if RSI_STRENGTH == 0:
+        return 1.0
+    s = RSI_STRENGTH
+    if side == "buy":
+        if rsi < 30:
+            return 1.0 + s * (30 - rsi) / 30
+        elif rsi > 70:
+            return max(0.1, 1.0 - s * (rsi - 70) / 30)
+    else:
+        if rsi > 70:
+            return 1.0 + s * (rsi - 70) / 30
+        elif rsi < 30:
+            return max(0.1, 1.0 - s * (30 - rsi) / 30)
+    return 1.0
+
+
+def get_ema_trend(exchange) -> float:
+    """Calcule le trend EMA fast/slow. Retourne (fast-slow)/slow normalise."""
+    if EMA_STRENGTH == 0:
+        return 0.0
+    try:
+        ohlcv = exchange.fetch_ohlcv(SYMBOL, "1h", limit=EMA_SLOW + 2)
+        closes = [c[4] for c in ohlcv]
+        if len(closes) < EMA_SLOW:
+            return 0.0
+        # SMA seed sur les premieres candles, puis EMA incrementale
+        ema_fast = sum(closes[:EMA_FAST]) / EMA_FAST
+        ema_slow = sum(closes[:EMA_SLOW]) / EMA_SLOW
+        k_fast = 2 / (EMA_FAST + 1)
+        k_slow = 2 / (EMA_SLOW + 1)
+        for c in closes[EMA_SLOW:]:
+            ema_fast = c * k_fast + ema_fast * (1 - k_fast)
+            ema_slow = c * k_slow + ema_slow * (1 - k_slow)
+        if ema_slow > 0:
+            return (ema_fast - ema_slow) / ema_slow
+        return 0.0
+    except Exception as e:
+        log.warning(f"Impossible de calculer EMA: {e}")
+        return 0.0
+
+
+def ema_multiplier(trend: float, side: str) -> float:
+    """Multiplicateur EMA: favorise les ordres dans le sens de la tendance."""
+    if EMA_STRENGTH == 0:
+        return 1.0
+    s = EMA_STRENGTH
+    t = max(-0.05, min(0.05, trend))
+    normalized = t / 0.05  # -1 a +1
+    if side == "buy":
+        return max(0.2, 1.0 + normalized * s * 0.5)
+    else:
+        return max(0.2, 1.0 - normalized * s * 0.5)
+
+
+def get_bb_spread(exchange) -> float:
+    """Calcule un spread adaptatif base sur la largeur des Bollinger Bands."""
+    if not BB_SPREAD_ADAPT:
+        return 0.0
+    try:
+        ohlcv = exchange.fetch_ohlcv(SYMBOL, "1h", limit=BB_PERIOD + 2)
+        closes = [c[4] for c in ohlcv]
+        if len(closes) < BB_PERIOD:
+            return 0.0
+        window = closes[-BB_PERIOD:]
+        sma = sum(window) / BB_PERIOD
+        if sma == 0:
+            return 0.0
+        variance = sum((x - sma) ** 2 for x in window) / BB_PERIOD
+        std = math.sqrt(variance)
+        upper = sma + BB_MULT * std
+        lower = sma - BB_MULT * std
+        bb_width = (upper - lower) / sma
+        # Spread = BB width / (2 * levels), clamped
+        bb_spread = bb_width / (2 * GRID_LEVELS)
+        return max(GRID_SPREAD, min(GRID_SPREAD * 4.0, bb_spread))
+    except Exception as e:
+        log.warning(f"Impossible de calculer BB: {e}")
+        return 0.0
+
+
+_current_spread = GRID_SPREAD  # spread lisse (persistant entre appels)
+_fear_greed_cache = {"value": 50, "last_fetch": 0}  # cache Fear & Greed
+
+
+def get_fear_greed() -> int:
+    """Recupere le Fear & Greed Index (0=extreme fear, 100=extreme greed).
+    Cache 1h pour eviter de spammer l'API."""
+    global _fear_greed_cache
+    if not FEAR_GREED_ENABLED:
+        return 50
+    now = time.time()
+    if now - _fear_greed_cache["last_fetch"] < 3600:
+        return _fear_greed_cache["value"]
+    try:
+        resp = requests.get(
+            "https://api.alternative.me/fng/?limit=1", timeout=10)
+        data = resp.json()
+        val = int(data["data"][0]["value"])
+        _fear_greed_cache = {"value": val, "last_fetch": now}
+        log.info(f"Fear & Greed Index: {val}")
+        return val
+    except Exception as e:
+        log.warning(f"Impossible de recuperer Fear & Greed: {e}")
+        return _fear_greed_cache["value"]
+
+
+def fear_greed_multiplier(fg_value: int, side: str) -> float:
+    """Multiplicateur Fear & Greed: acheter pendant la peur, vendre pendant la cupidite."""
+    if not FEAR_GREED_ENABLED:
+        return 1.0
+    if side == "buy":
+        if fg_value < 25:  # Extreme fear -> boost buys
+            return 1.0 + (25 - fg_value) / 25 * 0.5  # max 1.5x
+        elif fg_value > 75:  # Extreme greed -> reduce buys
+            return max(0.3, 1.0 - (fg_value - 75) / 25 * 0.7)
+    else:  # sell
+        if fg_value > 75:  # Extreme greed -> boost sells
+            return 1.0 + (fg_value - 75) / 25 * 0.5
+        elif fg_value < 25:  # Extreme fear -> reduce sells
+            return max(0.3, 1.0 - (25 - fg_value) / 25 * 0.7)
+    return 1.0
+
+
+def effective_spread(trend: float) -> float:
+    """Spread ajuste selon la tendance: plus large en tendance forte."""
+    s = _current_spread
+    if TREND_SPREAD_MULT > 0 and trend != 0:
+        t = max(-0.05, min(0.05, trend))
+        normalized = abs(t) / 0.05
+        s *= (1.0 + normalized * TREND_SPREAD_MULT)
+    return min(s, GRID_SPREAD * 4.0)
+
+
+def dd_multiplier(state: dict, price: float) -> float:
+    """Reduit les tailles quand le drawdown depasse le seuil."""
+    if DD_THRESHOLD >= 1.0:
+        return 1.0
+    start_val = state.get("initial_portfolio_value", 0)
+    if start_val <= 0:
+        return 1.0
+    balance = state.get("balance", {})
+    quote_asset = SYMBOL.split("/")[1]
+    base_asset = SYMBOL.split("/")[0]
+    current_val = (balance.get(quote_asset, {}).get("total", 0)
+                   + balance.get(base_asset, {}).get("total", 0) * price)
+    dd = (start_val - current_val) / start_val
+    if dd > DD_THRESHOLD:
+        return DD_FACTOR
+    return 1.0
+
+
 def adapt_spread(exchange) -> float:
-    """Ajuste le spread en fonction de la volatilite horaire."""
+    """Ajuste le spread en fonction de la volatilite horaire.
+    Lissage EMA 0.7/0.3 comme dans le backtest."""
+    global _current_spread
     vol = get_volatility(exchange)
     if vol <= 0:
-        return GRID_SPREAD
+        return _current_spread
     target = vol / 100 * 2.5  # 2.5x la volatilite horaire
-    min_spread = GRID_SPREAD * 0.5
+    min_spread = GRID_SPREAD  # floor = base spread (comme le backtest)
     max_spread = GRID_SPREAD * 4.0
-    return max(min_spread, min(max_spread, target))
+    target = max(min_spread, min(max_spread, target))
+    # Lissage EMA pour eviter les changements brusques
+    _current_spread = _current_spread * 0.7 + target * 0.3
+    return _current_spread
 
 
 GRID_TYPE       = os.getenv("GRID_TYPE", "geometric")       # "linear" ou "geometric"
 WEIGHT_FACTOR   = float(os.getenv("WEIGHT_FACTOR", 3.0))    # 0=egal, 3=4x aux extremes
+RSI_PERIOD      = int(os.getenv("RSI_PERIOD", 14))
+RSI_STRENGTH    = float(os.getenv("RSI_STRENGTH", 1.0))     # 0=off, 1=normal, 2=agressif
+EMA_FAST        = int(os.getenv("EMA_FAST", 12))
+EMA_SLOW        = int(os.getenv("EMA_SLOW", 26))
+EMA_STRENGTH    = float(os.getenv("EMA_STRENGTH", 0.0))     # 0=off, 1=normal, 2=agressif
+BB_PERIOD       = int(os.getenv("BB_PERIOD", 20))
+BB_MULT         = float(os.getenv("BB_MULT", 2.0))
+BB_SPREAD_ADAPT = os.getenv("BB_SPREAD_ADAPT", "false").lower() == "true"
 
 
 def _weight_multiplier(level: int) -> float:
@@ -286,12 +485,31 @@ def inventory_ratio(state: dict, price: float) -> float:
 
 def order_size(base_price: float, capital: float, exchange,
                side: str = "buy", inv_ratio: float = 0.5,
-               level: int = 1) -> float:
-    """Taille d'ordre par niveau avec gestion d'inventaire + ponderation."""
+               level: int = 1, rsi: float = 50.0,
+               trend: float = 0.0, state: dict = None,
+               fg_value: int = 50) -> float:
+    """Taille d'ordre par niveau: ponderation + inventaire + RSI + EMA + F&G + DD."""
     total_weight = sum(_weight_multiplier(i)
                        for i in range(1, GRID_LEVELS + 1))
     base_size_usdt = (capital / 2) / total_weight
     base_size_usdt *= _weight_multiplier(level)
+
+    # RSI: boost buys en survendu, boost sells en surachete
+    base_size_usdt *= rsi_multiplier(rsi, side)
+
+    # EMA: favoriser les ordres dans le sens de la tendance
+    base_size_usdt *= ema_multiplier(trend, side)
+
+    # Fear & Greed: acheter pendant la peur, vendre pendant la cupidite
+    base_size_usdt *= fear_greed_multiplier(fg_value, side)
+
+    # Drawdown protection
+    if state:
+        base_size_usdt *= dd_multiplier(state, base_price)
+
+    # Inventory cap: bloquer les buys si trop de BTC
+    if side == "buy" and inv_ratio >= MAX_INV_RATIO:
+        return 0.0
 
     if side == "buy":
         if inv_ratio > 0.6:
@@ -399,9 +617,13 @@ def _process_fill(exchange, state: dict, oid: str, order: dict,
             log.warning(f"Fill trop petit pour contre-ordre: {counter_size} "
                         f"< min {min_amount}")
             return
+        # Utiliser le spread effectif (trend-adaptatif)
+        trend = state.get("_last_trend", 0.0)
+        eff_sp = effective_spread(trend)
+
         if side == "buy":
             counter_price = round_price(exchange,
-                                        fill_price * (1 + GRID_SPREAD))
+                                        fill_price * (1 + eff_sp))
             if counter_size * counter_price < min_cost:
                 log.warning(f"Contre-ordre sous cout min: "
                             f"{counter_size * counter_price:.2f} < {min_cost}")
@@ -410,7 +632,7 @@ def _process_fill(exchange, state: dict, oid: str, order: dict,
                 SYMBOL, counter_size, counter_price)
         else:
             counter_price = round_price(exchange,
-                                        fill_price * (1 - GRID_SPREAD))
+                                        fill_price * (1 - eff_sp))
             if counter_size * counter_price < min_cost:
                 log.warning(f"Contre-ordre sous cout min: "
                             f"{counter_size * counter_price:.2f} < {min_cost}")
@@ -459,15 +681,29 @@ def place_grid(exchange, state: dict, market_info: dict):
     available_quote = balance.get(quote_asset, {}).get("free", 0)
     available_base = balance.get(base_asset, {}).get("free", 0)
 
-    # Spread dynamique via volatilite
+    # Spread dynamique + RSI + EMA + BB + Fear & Greed
     current_spread = adapt_spread(exchange)
+    current_rsi = get_rsi(exchange)
+    current_trend = get_ema_trend(exchange)
+    fg_value = get_fear_greed()
+
+    # BB spread override si active
+    bb_sp = get_bb_spread(exchange)
+    if bb_sp > 0:
+        current_spread = current_spread * 0.7 + bb_sp * 0.3
+
+    # Trend-adaptive spread
+    eff_spread = effective_spread(current_trend)
+    if eff_spread > current_spread:
+        current_spread = current_spread * 0.7 + eff_spread * 0.3
 
     inv_r = inventory_ratio(state, price)
     min_amount = market_info.get("min_amount", 0)
     min_cost = market_info.get("min_cost", 0)
 
     # Verifier taille minimale avec le plus petit niveau
-    min_size = order_size(price, capital, exchange, "buy", inv_r, 1)
+    min_size = order_size(price, capital, exchange, "buy", inv_r, 1,
+                          current_rsi, current_trend, state, fg_value)
     if min_size < min_amount or (min_size * price) < min_cost:
         msg = (f"Taille d'ordre trop petite: {min_size} "
                f"(min amount: {min_amount}, min cost: {min_cost} USDT) "
@@ -478,9 +714,13 @@ def place_grid(exchange, state: dict, market_info: dict):
 
     grid = compute_grid(price, exchange, current_spread)
 
+    ema_label = f"EMA:{current_trend:+.4f}" if EMA_STRENGTH > 0 else "EMA:off"
+    bb_label = f"BB:{bb_sp*100:.2f}%" if BB_SPREAD_ADAPT else "BB:off"
+    fg_label = f"F&G:{fg_value}" if FEAR_GREED_ENABLED else "F&G:off"
     log.info(f"Grille @ {price:.2f} | Capital: {capital:.2f} USDT "
              f"({CAPITAL_ALLOC:.0f}% de {state.get('portfolio_value', 0):.2f}) "
              f"| spread: {current_spread*100:.2f}% | inv: {inv_r*100:.0f}% "
+             f"| RSI: {current_rsi:.0f} | {ema_label} | {bb_label} | {fg_label} "
              f"| {GRID_TYPE} w={WEIGHT_FACTOR}")
     log.info(f"Solde libre: {available_quote:.2f} {quote_asset} | "
              f"{available_base:.6f} {base_asset}")
@@ -497,7 +737,8 @@ def place_grid(exchange, state: dict, market_info: dict):
         try:
             lvl = level["index"]
             size = order_size(price, capital, exchange,
-                              level["side"], inv_r, lvl)
+                              level["side"], inv_r, lvl, current_rsi,
+                              current_trend, state, fg_value)
             if level["side"] == "buy":
                 cost = size * level["price"]
                 if quote_used + cost > available_quote:
@@ -543,8 +784,7 @@ def place_grid(exchange, state: dict, market_info: dict):
     notify(
         f"**Grille placee — {SYMBOL}**\n"
         f"Prix: `{price:.2f}` | Niveaux: `{buys}B/{sells}S`\n"
-        f"Taille/niveau: `{size}` | Capital: `{capital:.2f} USDT` "
-        f"({CAPITAL_ALLOC:.0f}%)\n"
+        f"Capital: `{capital:.2f} USDT` ({CAPITAL_ALLOC:.0f}%)\n"
         f"Ordres places: `{len(placed)}` | Erreurs: `{errors}`"
     )
 
@@ -643,6 +883,14 @@ def rebalance_grid(exchange, state: dict, new_price: float, market_info: dict):
     available_base = balance.get(base_asset, {}).get("free", 0)
 
     current_spread = adapt_spread(exchange)
+    current_rsi = get_rsi(exchange)
+    current_trend = get_ema_trend(exchange)
+    fg_value = get_fear_greed()
+
+    bb_sp = get_bb_spread(exchange)
+    if bb_sp > 0:
+        current_spread = current_spread * 0.7 + bb_sp * 0.3
+
     inv_r = inventory_ratio(state, new_price)
     grid = compute_grid(new_price, exchange, current_spread)
 
@@ -657,7 +905,8 @@ def rebalance_grid(exchange, state: dict, new_price: float, market_info: dict):
         try:
             lvl = level["index"]
             size = order_size(new_price, capital, exchange,
-                              level["side"], inv_r, lvl)
+                              level["side"], inv_r, lvl, current_rsi,
+                              current_trend, state, fg_value)
             if level["side"] == "buy":
                 cost = size * level["price"]
                 if quote_used + cost > available_quote:
@@ -893,6 +1142,7 @@ class PaperExchange:
         return list(self.orders.values())
 
     def cancel_order(self, oid: str, symbol: str):
+        self._simulate_fills()  # traiter les fills avant de cancel
         if oid in self.orders:
             del self.orders[oid]
 
@@ -1091,6 +1341,52 @@ def main():
 
             price = get_current_price(exchange)
             state["current_price"] = price
+
+            # Stocker le trend pour les contre-ordres
+            state["_last_trend"] = get_ema_trend(exchange)
+
+            # Stale order decay: baisser le prix des contre-ordres ages
+            if STALE_HOURS > 0:
+                now_ts = time.time()
+                for oid, order in list(state.get("grid_orders", {}).items()):
+                    if not order.get("is_counter"):
+                        continue
+                    placed_str = order.get("placed_at", "")
+                    if not placed_str:
+                        continue
+                    try:
+                        placed_dt = datetime.fromisoformat(placed_str)
+                        placed_ts = placed_dt.timestamp()
+                    except (ValueError, TypeError):
+                        continue
+                    age_h = (now_ts - placed_ts) / 3600
+                    if age_h <= STALE_HOURS:
+                        continue
+                    stale_h = age_h - STALE_HOURS
+                    orig_price = order.get("original_fill_price", 0)
+                    if orig_price <= 0:
+                        continue
+                    if order["side"] == "sell":
+                        floor = orig_price * (1 + MAKER_FEE * 2 + 0.0001)
+                        decay = DECAY_PER_HOUR * stale_h * orig_price
+                        new_price = max(floor, order["price"] - decay)
+                        if new_price < order["price"] * 0.999:
+                            log.info(f"Stale decay: sell {oid} "
+                                     f"{order['price']:.2f} -> {new_price:.2f}")
+                            # Annuler et replacer l'ordre a un prix plus bas
+                            try:
+                                exchange.cancel_order(oid, SYMBOL)
+                                new_order = exchange.create_limit_sell_order(
+                                    SYMBOL, order["size"],
+                                    round_price(exchange, new_price))
+                                new_oid = str(new_order["id"])
+                                state["grid_orders"][new_oid] = {
+                                    **order, "id": new_oid,
+                                    "price": new_price,
+                                }
+                                del state["grid_orders"][oid]
+                            except Exception as e:
+                                log.warning(f"Stale decay error: {e}")
 
             # Detecter les fills et placer les contre-ordres
             check_fills_live(exchange, state, market_info)

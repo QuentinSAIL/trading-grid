@@ -65,6 +65,52 @@ def parse_args():
     parser.add_argument("--weight-factor", type=float, default=1.5,
                         help="Ponderation aux extremes: "
                              "0=egal, 1=double, 2=triple (defaut: 1.5)")
+    parser.add_argument("--rsi-period", type=int, default=14,
+                        help="Periode RSI (defaut: 14)")
+    parser.add_argument("--rsi-strength", type=float, default=1.0,
+                        help="Force du signal RSI: "
+                             "0=off, 1=normal, 2=agressif (defaut: 1.0)")
+    parser.add_argument("--ema-fast", type=int,
+                        default=int(os.getenv("EMA_FAST", 12)))
+    parser.add_argument("--ema-slow", type=int,
+                        default=int(os.getenv("EMA_SLOW", 26)))
+    parser.add_argument("--ema-strength", type=float,
+                        default=float(os.getenv("EMA_STRENGTH", 0.0)),
+                        help="Force du filtre EMA trend: 0=off (defaut: 0)")
+    parser.add_argument("--bb-period", type=int,
+                        default=int(os.getenv("BB_PERIOD", 20)),
+                        help="Periode Bollinger Bands (defaut: 20)")
+    parser.add_argument("--bb-mult", type=float,
+                        default=float(os.getenv("BB_MULT", 2.0)),
+                        help="Multiplicateur BB (defaut: 2.0)")
+    parser.add_argument("--bb-spread",
+                        action="store_true",
+                        default=os.getenv("BB_SPREAD_ADAPT", "false").lower() == "true",
+                        help="Adapter le spread aux Bollinger Bands")
+    parser.add_argument("--stale-hours", type=int,
+                        default=int(os.getenv("STALE_HOURS", 0)),
+                        help="Heures avant decay des contre-ordres (0=off)")
+    parser.add_argument("--decay-per-hour", type=float,
+                        default=float(os.getenv("DECAY_PER_HOUR", 0.0002)),
+                        help="Reduction prix/h apres stale (defaut: 0.02%%)")
+    parser.add_argument("--trend-spread-mult", type=float,
+                        default=float(os.getenv("TREND_SPREAD_MULT", 0.0)),
+                        help="Elargir spread en tendance (0=off)")
+    parser.add_argument("--dd-threshold", type=float,
+                        default=float(os.getenv("DD_THRESHOLD", 1.0)),
+                        help="Seuil drawdown pour reduire tailles (1.0=off)")
+    parser.add_argument("--dd-factor", type=float,
+                        default=float(os.getenv("DD_FACTOR", 0.5)),
+                        help="Facteur reduction si DD > seuil")
+    parser.add_argument("--max-inv-ratio", type=float,
+                        default=float(os.getenv("MAX_INV_RATIO", 1.0)),
+                        help="Cap inventaire BTC (1.0=off)")
+    parser.add_argument("--initial-btc-pct", type=float,
+                        default=float(os.getenv("INITIAL_BTC_PCT", 0.5)),
+                        help="Part initiale en BTC (0.5=50/50)")
+    parser.add_argument("--trend-liquidation", type=float,
+                        default=float(os.getenv("TREND_LIQUIDATION", 0.0)),
+                        help="Seuil trend pour liquider BTC (0=off)")
     return parser.parse_args()
 
 
@@ -106,7 +152,15 @@ def fetch_candles(exchange, symbol: str, timeframe: str,
 class GridBacktester:
     def __init__(self, capital, levels, spread, range_pct,
                  stop_loss_pct, maker_fee, taker_fee,
-                 grid_type="linear", weight_factor=0.0):
+                 grid_type="linear", weight_factor=0.0,
+                 rsi_period=14, rsi_strength=1.0,
+                 ema_fast=12, ema_slow=26, ema_strength=0.0,
+                 bb_period=20, bb_mult=2.0, bb_spread_adapt=False,
+                 stale_hours=0, decay_per_hour=0.0002,
+                 trend_spread_mult=0.0, dd_threshold=1.0,
+                 dd_factor=0.5, max_inv_ratio=1.0,
+                 initial_btc_pct=0.5, trend_liquidation=0.0,
+                 rebalance_every=0):
         self.initial_capital = capital
         self.capital = capital    # USDT disponible
         self.levels = levels
@@ -116,11 +170,31 @@ class GridBacktester:
         self.stop_loss_pct = stop_loss_pct
         self.maker_fee = maker_fee
         self.taker_fee = taker_fee
-        self.grid_type = grid_type        # "linear" ou "geometric"
-        self.weight_factor = weight_factor  # 0=egal, 1=double aux extremes, 2=triple
+        self.grid_type = grid_type
+        self.weight_factor = weight_factor
+        self.rsi_period = rsi_period
+        self.rsi_strength = rsi_strength
+        self.ema_fast_period = ema_fast
+        self.ema_slow_period = ema_slow
+        self.ema_strength = ema_strength   # 0=off, 1=normal, 2=agressif
+        self.bb_period = bb_period
+        self.bb_mult = bb_mult
+        self.bb_spread_adapt = bb_spread_adapt  # adapter le spread a la BB width
+
+        # Nouvelles features
+        self.stale_hours = stale_hours        # heures avant decay (0=off)
+        self.decay_per_hour = decay_per_hour  # reduction prix/h apres stale
+        self.trend_spread_mult = trend_spread_mult  # elargir spread en tendance
+        self.dd_threshold = dd_threshold      # seuil DD pour reduire tailles
+        self.dd_factor = dd_factor            # facteur reduction si DD > seuil
+        self.max_inv_ratio = max_inv_ratio    # cap inventaire BTC (0-1)
+        self.initial_btc_pct = initial_btc_pct  # % capital initial en BTC
+        self.trend_liquidation = trend_liquidation  # seuil trend pour liquider
+        self.rebalance_every = rebalance_every  # refresh grille tous les N candles (0=off)
 
         self.grid_orders = {}
-        self.btc_held = 0.0       # BTC detenu (pour tracking inventaire)
+        self._candle_count = 0
+        self.btc_held = 0.0
         self.total_profit = 0.0
         self.total_fees = 0.0
         self.total_trades = 0
@@ -132,16 +206,30 @@ class GridBacktester:
         self.max_drawdown = 0.0
         self.stopped = False
         self._oid = 0
+        self.stale_decays = 0  # compteur ordres decayed
 
-        # Volatilite dynamique — FLOOR = base_spread (jamais en dessous)
+        # Volatilite dynamique — FLOOR = base_spread
         self.closes_history = []
         self.volatility_window = 24
         self.max_spread = spread * 4.0
 
-        # Stats supplementaires
-        self.rebalance_count = 0
+        # RSI (Wilder smoothing)
+        self.current_rsi = 50.0
+        self._rsi_avg_gain = 0.0
+        self._rsi_avg_loss = 0.0
+        self._rsi_initialized = False
 
-        # Demarrage 50/50 pour capter la tendance
+        # EMA
+        self._ema_fast = 0.0
+        self._ema_slow = 0.0
+        self._ema_initialized = False
+        self.trend = 0.0  # >0 = bullish, <0 = bearish
+
+        # Bollinger Bands
+        self.bb_width = 0.0  # % width
+
+        # Stats
+        self.rebalance_count = 0
         self._needs_initial_split = True
 
     def _new_id(self) -> str:
@@ -171,6 +259,136 @@ class GridBacktester:
         target = max(self.base_spread, min(self.max_spread, target))
         # Lissage pour eviter les changements brusques
         self.spread = self.spread * 0.7 + target * 0.3
+
+    def _update_rsi(self):
+        """RSI incrementale (Wilder smoothing) — O(1) par bougie."""
+        closes = self.closes_history
+        n = self.rsi_period
+        if len(closes) < 2:
+            return
+        delta = closes[-1] - closes[-2]
+        gain = max(0, delta)
+        loss = max(0, -delta)
+
+        if not self._rsi_initialized:
+            # Besoin de `period + 1` closes pour initialiser
+            if len(closes) < n + 1:
+                return
+            # Premiere moyenne: SMA sur les `period` premiers deltas
+            gains = []
+            losses = []
+            for i in range(len(closes) - n, len(closes)):
+                d = closes[i] - closes[i - 1]
+                gains.append(max(0, d))
+                losses.append(max(0, -d))
+            self._rsi_avg_gain = sum(gains) / n
+            self._rsi_avg_loss = sum(losses) / n
+            self._rsi_initialized = True
+        else:
+            # Wilder smoothing: EMA-like avec period
+            self._rsi_avg_gain = (self._rsi_avg_gain * (n - 1) + gain) / n
+            self._rsi_avg_loss = (self._rsi_avg_loss * (n - 1) + loss) / n
+
+        if self._rsi_avg_loss == 0:
+            self.current_rsi = 100.0
+        else:
+            rs = self._rsi_avg_gain / self._rsi_avg_loss
+            self.current_rsi = 100 - (100 / (1 + rs))
+
+    def _update_ema(self):
+        """EMA rapide/lente pour detecter la tendance."""
+        c = self.closes_history[-1]
+        if not self._ema_initialized:
+            if len(self.closes_history) >= self.ema_slow_period:
+                self._ema_fast = sum(self.closes_history[-self.ema_fast_period:]) / self.ema_fast_period
+                self._ema_slow = sum(self.closes_history[-self.ema_slow_period:]) / self.ema_slow_period
+                self._ema_initialized = True
+            return
+        k_fast = 2 / (self.ema_fast_period + 1)
+        k_slow = 2 / (self.ema_slow_period + 1)
+        self._ema_fast = c * k_fast + self._ema_fast * (1 - k_fast)
+        self._ema_slow = c * k_slow + self._ema_slow * (1 - k_slow)
+        # Trend: normalise entre -1 et +1
+        if self._ema_slow > 0:
+            self.trend = (self._ema_fast - self._ema_slow) / self._ema_slow
+
+    def _update_bb(self):
+        """Bollinger Bands width — mesure de compression/expansion."""
+        if len(self.closes_history) < self.bb_period:
+            return
+        window = self.closes_history[-self.bb_period:]
+        sma = sum(window) / self.bb_period
+        if sma == 0:
+            return
+        variance = sum((x - sma) ** 2 for x in window) / self.bb_period
+        std = math.sqrt(variance)
+        upper = sma + self.bb_mult * std
+        lower = sma - self.bb_mult * std
+        self.bb_width = (upper - lower) / sma  # en %
+
+    def _effective_spread(self) -> float:
+        """Spread ajuste selon la tendance: plus large en tendance forte."""
+        s = self.spread
+        if self.trend_spread_mult > 0 and self._ema_initialized:
+            t = max(-0.05, min(0.05, self.trend))
+            normalized = abs(t) / 0.05  # 0 a 1
+            s *= (1.0 + normalized * self.trend_spread_mult)
+        return min(s, self.max_spread)
+
+    def _dd_multiplier(self) -> float:
+        """Reduit les tailles quand le drawdown depasse le seuil."""
+        if self.dd_threshold >= 1.0 or self.max_equity <= 0:
+            return 1.0
+        current_equity = self.capital + self.btc_held * (
+            self.closes_history[-1] if self.closes_history else 0)
+        current_dd = (self.max_equity - current_equity) / self.max_equity
+        if current_dd > self.dd_threshold:
+            return self.dd_factor
+        return 1.0
+
+    def _ema_multiplier(self, side: str) -> float:
+        """Multiplicateur EMA: favorise les ordres dans le sens de la tendance.
+        Trend haussiere: boost les buys, reduit les sells.
+        Trend baissiere: boost les sells, reduit les buys."""
+        if self.ema_strength == 0 or not self._ema_initialized:
+            return 1.0
+        s = self.ema_strength
+        # trend est typiquement entre -0.05 et +0.05
+        t = max(-0.05, min(0.05, self.trend))
+        normalized = t / 0.05  # -1 a +1
+
+        if side == "buy":
+            # Trend up -> boost buys (max 1+s), trend down -> reduce (min 1-s*0.5)
+            return max(0.2, 1.0 + normalized * s * 0.5)
+        else:
+            # Trend up -> reduce sells, trend down -> boost sells
+            return max(0.2, 1.0 - normalized * s * 0.5)
+
+    def _rsi_multiplier(self, side: str) -> float:
+        """Multiplicateur RSI pour la taille des ordres.
+        RSI < 30 (survendu): boost les buys, reduit les sells
+        RSI > 70 (surachete): boost les sells, reduit les buys
+        RSI 30-70 (neutre): pas d'effet"""
+        if self.rsi_strength == 0:
+            return 1.0
+        rsi = self.current_rsi
+        s = self.rsi_strength
+
+        if side == "buy":
+            if rsi < 30:
+                # Survendu: acheter plus (RSI 0->30 donne 1+s -> 1)
+                return 1.0 + s * (30 - rsi) / 30
+            elif rsi > 70:
+                # Surachete: acheter moins (RSI 70->100 donne 1 -> max(0.1, 1-s))
+                return max(0.1, 1.0 - s * (rsi - 70) / 30)
+        else:  # sell
+            if rsi > 70:
+                # Surachete: vendre plus
+                return 1.0 + s * (rsi - 70) / 30
+            elif rsi < 30:
+                # Survendu: vendre moins
+                return max(0.1, 1.0 - s * (30 - rsi) / 30)
+        return 1.0
 
     def _inventory_ratio(self, price: float) -> float:
         """Part du portefeuille en BTC (0 = tout USDT, 1 = tout BTC)."""
@@ -204,20 +422,32 @@ class GridBacktester:
 
     def order_size(self, base_price: float, side: str,
                    level: int = 1) -> float:
-        """Taille par niveau avec gestion d'inventaire + ponderation."""
+        """Taille par niveau: ponderation + inventaire + RSI + DD protection."""
         portfolio_value = self.capital + self.btc_held * base_price
         effective = portfolio_value * 0.9
 
-        # Normaliser la taille de base pour que la somme ponderee
-        # des ordres utilise ~50% du capital par cote
         total_weight = sum(self._weighted_multiplier(i)
                            for i in range(1, self.levels + 1))
         base_size_usdt = (effective / 2) / total_weight
 
-        # Appliquer le poids du niveau
+        # Poids du niveau (DCA)
         base_size_usdt *= self._weighted_multiplier(level)
 
+        # RSI: boost buys en survendu, boost sells en surachete
+        base_size_usdt *= self._rsi_multiplier(side)
+
+        # EMA: favoriser les ordres dans le sens de la tendance
+        base_size_usdt *= self._ema_multiplier(side)
+
+        # Drawdown protection: reduire les tailles si DD > seuil
+        base_size_usdt *= self._dd_multiplier()
+
+        # Inventaire: eviter l'accumulation excessive
         inv_ratio = self._inventory_ratio(base_price)
+
+        # Cap inventaire: bloquer les buys si trop de BTC
+        if side == "buy" and inv_ratio >= self.max_inv_ratio:
+            return 0.0
 
         if side == "buy":
             if inv_ratio > 0.6:
@@ -241,6 +471,9 @@ class GridBacktester:
                           if o.get("is_counter")}
         self.grid_orders = dict(counter_orders)
         self.grid_base_price = price
+        # Utiliser le spread effectif (ajuste tendance)
+        old_spread = self.spread
+        self.spread = self._effective_spread()
 
         quote_used = 0.0
         base_used = 0.0
@@ -277,19 +510,62 @@ class GridBacktester:
         if self.stopped:
             return
 
-        # Tracking volatilite
+        # Tracking indicateurs
         self.closes_history.append(c)
         self._update_dynamic_spread()
+        self._update_rsi()
+        self._update_ema()
+        self._update_bb()
 
-        # Demarrage 50/50: acheter du BTC avec la moitie du capital
+        # BB spread adaptation: utilise la BB width comme spread dynamique
+        if self.bb_spread_adapt and self.bb_width > 0:
+            bb_spread = self.bb_width / (2 * self.levels)
+            bb_spread = max(self.base_spread, min(self.max_spread, bb_spread))
+            self.spread = self.spread * 0.7 + bb_spread * 0.3
+
+        # Demarrage: acheter du BTC selon le ratio initial
         if self._needs_initial_split:
-            btc_to_buy = (self.capital * 0.5) / o
+            btc_to_buy = (self.capital * self.initial_btc_pct) / o
             self.capital -= btc_to_buy * o
             self.btc_held += btc_to_buy
             self._needs_initial_split = False
 
         if self.grid_base_price is None:
             self.place_grid(o, ts)
+
+        # Stale order decay: baisser le prix des contre-ordres ages
+        if self.stale_hours > 0:
+            stale_threshold_ms = self.stale_hours * 3600 * 1000
+            for oid, order in list(self.grid_orders.items()):
+                if not order.get("is_counter"):
+                    continue
+                placed = order.get("placed_at", 0)
+                if placed <= 0:
+                    continue
+                age_ms = ts - placed
+                if age_ms <= stale_threshold_ms:
+                    continue
+                # Heures depuis que l'ordre est stale
+                stale_h = (age_ms - stale_threshold_ms) / 3_600_000
+                orig_price = order.get("original_fill_price", 0)
+                if orig_price <= 0:
+                    continue
+                if order["side"] == "sell":
+                    # Baisser le prix de vente vers le break-even
+                    floor = orig_price * (1 + self.maker_fee * 2 + 0.0001)
+                    decay = self.decay_per_hour * stale_h * orig_price
+                    new_price = max(floor, order["price"] - decay)
+                    if new_price < order["price"]:
+                        order["price"] = new_price
+                        self.stale_decays += 1
+                else:  # buy counter
+                    # Monter le prix d'achat vers le break-even
+                    ceil = orig_price * (1 - self.maker_fee * 2 - 0.0001)
+                    decay = self.decay_per_hour * stale_h * orig_price
+                    new_price = min(ceil, order["price"] + decay)
+                    if new_price > order["price"]:
+                        order["price"] = new_price
+                        self.stale_decays += 1
 
         # Verifier les fills
         filled_ids = []
@@ -349,22 +625,25 @@ class GridBacktester:
                 "profit": profit, "is_counter": is_counter,
             })
 
-            # Contre-ordre avec le spread courant (dynamique)
+            # Contre-ordre avec le spread effectif (tendance-adaptatif)
+            eff_spread = self._effective_spread()
             if side == "buy":
-                counter_price = fill_price * (1 + self.spread)
+                counter_price = fill_price * (1 + eff_spread)
                 new_id = self._new_id()
                 self.grid_orders[new_id] = {
                     "side": "sell", "price": counter_price,
                     "size": size, "is_counter": True,
                     "original_fill_price": fill_price,
+                    "placed_at": ts,
                 }
             else:
-                counter_price = fill_price * (1 - self.spread)
+                counter_price = fill_price * (1 - eff_spread)
                 new_id = self._new_id()
                 self.grid_orders[new_id] = {
                     "side": "buy", "price": counter_price,
                     "size": size, "is_counter": True,
                     "original_fill_price": fill_price,
+                    "placed_at": ts,
                 }
 
         # Equity = valeur totale du portefeuille
@@ -383,6 +662,29 @@ class GridBacktester:
         if loss_pct >= self.stop_loss_pct:
             self.stopped = True
             return
+
+        # Trend liquidation: vendre du BTC si tendance tres baissiere
+        if (self.trend_liquidation > 0 and self._ema_initialized
+                and self.trend < -self.trend_liquidation):
+            inv = self._inventory_ratio(c)
+            # Si on a plus de 40% en BTC et tendance fortement baissiere
+            if inv > 0.4:
+                # Vendre 10% du BTC pour reduire l'exposition
+                sell_pct = min(0.1, (inv - 0.3))
+                sell_amount = self.btc_held * sell_pct
+                if sell_amount > 0:
+                    proceeds = sell_amount * c
+                    fee = proceeds * self.taker_fee
+                    self.btc_held -= sell_amount
+                    self.capital += proceeds - fee
+                    self.total_fees += fee
+                    self.total_trades += 1
+
+        # Rebalancement force pour compounder les profits
+        self._candle_count += 1
+        if (self.rebalance_every > 0
+                and self._candle_count % self.rebalance_every == 0):
+            self.place_grid(c, ts)
 
         # Trailing grid base + recentrage
         if self.grid_base_price:
@@ -425,6 +727,18 @@ def display_results(bt: GridBacktester, candles: list, args):
                    f"{bt.spread * 100:.2f}% final (dynamique)")
     config.add_row("Grille",
                    f"{bt.grid_type} | poids: {bt.weight_factor}x aux extremes")
+    rsi_label = "off" if bt.rsi_strength == 0 else f"{bt.rsi_strength}x (RSI-{bt.rsi_period})"
+    config.add_row("RSI", rsi_label)
+    ema_label = "off" if bt.ema_strength == 0 else f"{bt.ema_strength}x (EMA {bt.ema_fast_period}/{bt.ema_slow_period})"
+    config.add_row("EMA trend", ema_label)
+    config.add_row("BB spread", "on" if bt.bb_spread_adapt else "off")
+    stale_label = "off" if bt.stale_hours == 0 else f"{bt.stale_hours}h / decay {bt.decay_per_hour*100:.02f}%/h"
+    config.add_row("Stale decay", stale_label)
+    config.add_row("Trend spread", "off" if bt.trend_spread_mult == 0 else f"{bt.trend_spread_mult}x")
+    dd_label = "off" if bt.dd_threshold >= 1.0 else f">{bt.dd_threshold*100:.0f}% -> x{bt.dd_factor}"
+    config.add_row("DD protection", dd_label)
+    inv_label = "off" if bt.max_inv_ratio >= 1.0 else f"{bt.max_inv_ratio*100:.0f}%"
+    config.add_row("Inv cap", inv_label)
     config.add_row("Frais",
                    f"maker {bt.maker_fee * 100:.2f}% / "
                    f"taker {bt.taker_fee * 100:.2f}%")
@@ -462,6 +776,8 @@ def display_results(bt: GridBacktester, candles: list, args):
     results.add_row("Max drawdown",
                     Text(f"{bt.max_drawdown * 100:.2f}%", style="yellow"))
     results.add_row("Rebalances", f"{bt.rebalance_count}")
+    if bt.stale_decays > 0:
+        results.add_row("Stale decays", f"{bt.stale_decays}")
     inv_ratio = bt._inventory_ratio(end_price) * 100
     inv_style = "yellow" if inv_ratio > 60 else "green"
     results.add_row("Inventaire BTC",
@@ -576,6 +892,22 @@ def main():
         taker_fee=args.taker_fee,
         grid_type=args.grid_type,
         weight_factor=args.weight_factor,
+        rsi_period=args.rsi_period,
+        rsi_strength=args.rsi_strength,
+        ema_fast=args.ema_fast,
+        ema_slow=args.ema_slow,
+        ema_strength=args.ema_strength,
+        bb_period=args.bb_period,
+        bb_mult=args.bb_mult,
+        bb_spread_adapt=args.bb_spread,
+        stale_hours=args.stale_hours,
+        decay_per_hour=args.decay_per_hour,
+        trend_spread_mult=args.trend_spread_mult,
+        dd_threshold=args.dd_threshold,
+        dd_factor=args.dd_factor,
+        max_inv_ratio=args.max_inv_ratio,
+        initial_btc_pct=args.initial_btc_pct,
+        trend_liquidation=args.trend_liquidation,
     )
 
     with Progress(console=console) as progress:
