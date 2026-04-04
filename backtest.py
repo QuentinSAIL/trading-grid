@@ -83,10 +83,13 @@ def parse_args():
     parser.add_argument("--bb-mult", type=float,
                         default=float(os.getenv("BB_MULT", 2.0)),
                         help="Multiplicateur BB (defaut: 2.0)")
-    parser.add_argument("--bb-spread",
-                        action="store_true",
-                        default=os.getenv("BB_SPREAD_ADAPT", "false").lower() == "true",
+    bb_default = os.getenv("BB_SPREAD_ADAPT", "false").lower() == "true"
+    parser.add_argument("--bb-spread", action="store_true",
+                        default=bb_default,
                         help="Adapter le spread aux Bollinger Bands")
+    parser.add_argument("--no-bb-spread", action="store_true",
+                        default=False,
+                        help="Desactiver adaptation BB spread")
     parser.add_argument("--stale-hours", type=int,
                         default=int(os.getenv("STALE_HOURS", 0)),
                         help="Heures avant decay des contre-ordres (0=off)")
@@ -111,6 +114,24 @@ def parse_args():
     parser.add_argument("--trend-liquidation", type=float,
                         default=float(os.getenv("TREND_LIQUIDATION", 0.0)),
                         help="Seuil trend pour liquider BTC (0=off)")
+    parser.add_argument("--rebalance-every", type=int,
+                        default=int(os.getenv("REBALANCE_EVERY", 6)),
+                        help="Force rebalance inventory every N candles (0=off)")
+    parser.add_argument("--grid-refresh", type=int,
+                        default=int(os.getenv("GRID_REFRESH", 0)),
+                        help="Force grid refresh every N candles (0=use rebalance-every)")
+    parser.add_argument("--inv-target", type=float,
+                        default=float(os.getenv("INV_TARGET", 0.3)),
+                        help="Target inventory ratio (default: 0.3)")
+    parser.add_argument("--inv-tolerance", type=float,
+                        default=float(os.getenv("INV_TOLERANCE", 0.10)),
+                        help="Rebalance if inv deviates more than this from target")
+    parser.add_argument("--bear-threshold", type=float,
+                        default=float(os.getenv("BEAR_THRESHOLD", -0.005)),
+                        help="Trend threshold for bear regime (default: -0.005)")
+    parser.add_argument("--bear-spread-mult", type=float,
+                        default=float(os.getenv("BEAR_SPREAD_MULT", 0.4)),
+                        help="Spread multiplier in bear regime (default: 0.4)")
     return parser.parse_args()
 
 
@@ -160,7 +181,9 @@ class GridBacktester:
                  trend_spread_mult=0.0, dd_threshold=1.0,
                  dd_factor=0.5, max_inv_ratio=1.0,
                  initial_btc_pct=0.5, trend_liquidation=0.0,
-                 rebalance_every=0):
+                 rebalance_every=0, grid_refresh=0,
+                 inv_target=0.3, inv_tolerance=0.10,
+                 bear_threshold=-0.005, bear_spread_mult=0.4):
         self.initial_capital = capital
         self.capital = capital    # USDT disponible
         self.levels = levels
@@ -190,7 +213,12 @@ class GridBacktester:
         self.max_inv_ratio = max_inv_ratio    # cap inventaire BTC (0-1)
         self.initial_btc_pct = initial_btc_pct  # % capital initial en BTC
         self.trend_liquidation = trend_liquidation  # seuil trend pour liquider
-        self.rebalance_every = rebalance_every  # refresh grille tous les N candles (0=off)
+        self.rebalance_every = rebalance_every  # rebal inventaire tous les N candles (0=off)
+        self.grid_refresh = grid_refresh if grid_refresh > 0 else rebalance_every
+        self.bear_threshold = bear_threshold
+        self.bear_spread_mult = bear_spread_mult
+        self.inv_target = inv_target            # ratio cible d'inventaire token
+        self.inv_tolerance = inv_tolerance      # seuil de deviation pour rebalance
 
         self.grid_orders = {}
         self._candle_count = 0
@@ -199,6 +227,11 @@ class GridBacktester:
         self.total_fees = 0.0
         self.total_trades = 0
         self.cycles_completed = 0
+        # Swing trading overlay
+        self._swing_position = 0.0   # Amount held for swing
+        self._swing_entry_price = 0.0
+        self._swing_active = False
+        self.swing_profits = 0.0
         self.grid_base_price = None
         self.fills = []
         self.equity_curve = []
@@ -219,11 +252,17 @@ class GridBacktester:
         self._rsi_avg_loss = 0.0
         self._rsi_initialized = False
 
-        # EMA
+        # EMA (main trend)
         self._ema_fast = 0.0
         self._ema_slow = 0.0
         self._ema_initialized = False
         self.trend = 0.0  # >0 = bullish, <0 = bearish
+
+        # Fast EMA (3/8) for quick inventory decisions
+        self._fast_ema3 = 0.0
+        self._fast_ema8 = 0.0
+        self._fast_ema_initialized = False
+        self.fast_trend = 0.0
 
         # Bollinger Bands
         self.bb_width = 0.0  # % width
@@ -311,6 +350,20 @@ class GridBacktester:
         # Trend: normalise entre -1 et +1
         if self._ema_slow > 0:
             self.trend = (self._ema_fast - self._ema_slow) / self._ema_slow
+
+        # Fast EMA (3/8) for quick inventory decisions
+        if not self._fast_ema_initialized:
+            if len(self.closes_history) >= 8:
+                self._fast_ema3 = sum(self.closes_history[-3:]) / 3
+                self._fast_ema8 = sum(self.closes_history[-8:]) / 8
+                self._fast_ema_initialized = True
+        else:
+            k3 = 2 / (3 + 1)
+            k8 = 2 / (8 + 1)
+            self._fast_ema3 = c * k3 + self._fast_ema3 * (1 - k3)
+            self._fast_ema8 = c * k8 + self._fast_ema8 * (1 - k8)
+            if self._fast_ema8 > 0:
+                self.fast_trend = (self._fast_ema3 - self._fast_ema8) / self._fast_ema8
 
     def _update_bb(self):
         """Bollinger Bands width — mesure de compression/expansion."""
@@ -466,20 +519,37 @@ class GridBacktester:
     def place_grid(self, price: float, timestamp: int):
         """Place la grille avec spread dynamique, spacing geometrique/lineaire,
         sizing pondere et inventaire-aware.
-        Preserve les contre-ordres existants."""
+        Preserve les contre-ordres existants.
+        TREND-AWARE: adapte les parametres au regime de marche."""
         counter_orders = {oid: o for oid, o in self.grid_orders.items()
                           if o.get("is_counter")}
         self.grid_orders = dict(counter_orders)
         self.grid_base_price = price
-        # Utiliser le spread effectif (ajuste tendance)
         old_spread = self.spread
         self.spread = self._effective_spread()
 
         quote_used = 0.0
         base_used = 0.0
 
-        for i in range(1, self.levels + 1):
-            buy_size = self.order_size(price, "buy", i)
+        # Adaptive grid: adjust spread and levels based on regime
+        active_levels = self.levels
+        active_spread = self.spread
+        if self._ema_initialized and self.trend < -0.005:
+            # Bear regime: tighter spread for faster cycles on bounces
+            active_spread = max(self.base_spread * 0.3, self.spread * 0.4)
+            active_levels = max(1, self.levels + 1)  # one more level for coverage
+
+        # Trend-aware buy scaling
+        buy_scale = 1.0
+        if self._ema_initialized and self.trend < -0.005:
+            buy_scale = max(0.1, 1.0 + self.trend * 20)
+
+        # Temporarily set spread for grid price calculation
+        saved_spread = self.spread
+        self.spread = active_spread
+
+        for i in range(1, active_levels + 1):
+            buy_size = self.order_size(price, "buy", i) * buy_scale
             buy_price = self._grid_price(price, i, "buy")
             buy_cost = buy_size * buy_price
             if buy_cost > 0 and quote_used + buy_cost <= self.capital:
@@ -503,6 +573,9 @@ class GridBacktester:
                     "is_counter": False,
                 }
                 base_used += sell_size
+
+        self.spread = saved_spread  # Restore original spread
+
 
     def process_candle(self, candle: list):
         """Simule une bougie: [timestamp, open, high, low, close, volume]."""
@@ -626,22 +699,35 @@ class GridBacktester:
             })
 
             # Contre-ordre avec le spread effectif (tendance-adaptatif)
-            eff_spread = self._effective_spread()
+            # Scalp orders utilisent leur propre spread serré
+            if "scalp_spread" in order:
+                eff_spread = order["scalp_spread"]
+            else:
+                eff_spread = self._effective_spread()
+            inv = self._inventory_ratio(c if c else fill_price)
             if side == "buy":
                 counter_price = fill_price * (1 + eff_spread)
+                counter_size = size
+                # Si trop de token, reduire le contre-achat futur
+                # (le sell va quand meme se faire, mais on marque pour le prochain cycle)
                 new_id = self._new_id()
                 self.grid_orders[new_id] = {
                     "side": "sell", "price": counter_price,
-                    "size": size, "is_counter": True,
+                    "size": counter_size, "is_counter": True,
                     "original_fill_price": fill_price,
                     "placed_at": ts,
                 }
             else:
                 counter_price = fill_price * (1 - eff_spread)
+                counter_size = size
+                # Si trop de token deja, reduire le contre-achat
+                if inv > self.inv_target + self.inv_tolerance:
+                    scale = max(0.2, 1.0 - (inv - self.inv_target) * 3)
+                    counter_size *= scale
                 new_id = self._new_id()
                 self.grid_orders[new_id] = {
                     "side": "buy", "price": counter_price,
-                    "size": size, "is_counter": True,
+                    "size": counter_size, "is_counter": True,
                     "original_fill_price": fill_price,
                     "placed_at": ts,
                 }
@@ -680,10 +766,58 @@ class GridBacktester:
                     self.total_fees += fee
                     self.total_trades += 1
 
-        # Rebalancement force pour compounder les profits
+        # Inventaire DYNAMIQUE: rebalance frequent, grid refresh independant
         self._candle_count += 1
+
+        # 1) Rebalance inventaire
         if (self.rebalance_every > 0
                 and self._candle_count % self.rebalance_every == 0):
+            dynamic_target = self.inv_target
+            if self._ema_initialized:
+                # Utiliser fast_trend (EMA 3/8) pour réagir plus vite en bear
+                ft = self.fast_trend if self._fast_ema_initialized else self.trend
+                # En bear (fast_trend < 0): utiliser fast_trend pour sell rapide
+                # En bull (fast_trend > 0): utiliser slow trend pour buy progressif
+                t_sell = max(-0.05, min(0.05, ft))
+                t_buy = max(-0.05, min(0.05, self.trend))
+                t = t_sell if ft < 0 else t_buy
+                trend_mult = 1.0 + t * 30
+                dynamic_target = max(0.01, min(0.30, self.inv_target * trend_mult))
+
+            inv = self._inventory_ratio(c)
+            if inv > dynamic_target + self.inv_tolerance:
+                portfolio_val = self.capital + self.btc_held * c
+                target_token_val = portfolio_val * dynamic_target
+                current_token_val = self.btc_held * c
+                excess_val = current_token_val - target_token_val
+                if excess_val > 0:
+                    sell_amount = excess_val / c * 0.8
+                    if sell_amount > 0 and sell_amount <= self.btc_held:
+                        proceeds = sell_amount * c
+                        fee = proceeds * self.taker_fee
+                        self.btc_held -= sell_amount
+                        self.capital += proceeds - fee
+                        self.total_fees += fee
+                        self.total_trades += 1
+            elif (inv < dynamic_target - self.inv_tolerance
+                  and self._ema_initialized and self.trend > 0.01):
+                portfolio_val = self.capital + self.btc_held * c
+                target_token_val = portfolio_val * dynamic_target
+                current_token_val = self.btc_held * c
+                deficit_val = target_token_val - current_token_val
+                if deficit_val > 0 and deficit_val < self.capital * 0.3:
+                    buy_amount = deficit_val / c * 0.5
+                    cost = buy_amount * c
+                    fee = cost * self.taker_fee
+                    if cost + fee <= self.capital:
+                        self.capital -= cost + fee
+                        self.btc_held += buy_amount
+                        self.total_fees += fee
+                        self.total_trades += 1
+
+        # 2) Grid refresh (moins frequent, laisse les ordres travailler)
+        if (self.grid_refresh > 0
+                and self._candle_count % self.grid_refresh == 0):
             self.place_grid(c, ts)
 
         # Trailing grid base + recentrage
@@ -899,7 +1033,7 @@ def main():
         ema_strength=args.ema_strength,
         bb_period=args.bb_period,
         bb_mult=args.bb_mult,
-        bb_spread_adapt=args.bb_spread,
+        bb_spread_adapt=args.bb_spread and not args.no_bb_spread,
         stale_hours=args.stale_hours,
         decay_per_hour=args.decay_per_hour,
         trend_spread_mult=args.trend_spread_mult,
@@ -908,6 +1042,12 @@ def main():
         max_inv_ratio=args.max_inv_ratio,
         initial_btc_pct=args.initial_btc_pct,
         trend_liquidation=args.trend_liquidation,
+        rebalance_every=args.rebalance_every,
+        grid_refresh=args.grid_refresh,
+        inv_target=args.inv_target,
+        inv_tolerance=args.inv_tolerance,
+        bear_threshold=args.bear_threshold,
+        bear_spread_mult=args.bear_spread_mult,
     )
 
     with Progress(console=console) as progress:

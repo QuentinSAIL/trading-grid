@@ -31,33 +31,29 @@ console = Console(force_terminal=True, width=250)
 
 # --- Parametres a tester ---
 
-# Mini-sweep H: Validation - saturation RSI/weight + test 200j
-# Best G: spread=0.007, levels=3, weight=-0.8, RSI=3.0, EMA=off
-# stale=72/0.0008, inv=0.20, btc=0.25
 PARAM_GRID = {
-    "spread":        [0.006, 0.007, 0.008],
-    "levels":        [3],
-    "weight_factor": [-0.9, -0.8, -0.7, -0.5],
+    "spread":        [0.005, 0.006, 0.007, 0.008],
+    "levels":        [2, 3, 4],
+    "weight_factor": [-0.9, -0.5, 0, 0.5],
     "range_pct":     [0.04, 0.05],
-    "rsi_period":    [14],
-    "rsi_strength":  [2.5, 3.0, 4.0, 5.0],
-    "ema_fast":      [12],
-    "ema_slow":      [26],
-    "ema_strength":  [0],
+    "rsi_period":    [14, 21],
+    "rsi_strength":  [5.0, 7.0, 10.0],
+    "ema_fast":      [12, 18],
+    "ema_slow":      [26, 50],
+    "ema_strength":  [0.5, 1.0],
     "bb_period":     [20],
     "bb_mult":       [2.0],
     "bb_spread":     [True],
     "stale_hours":   [72],
-    "decay_per_hour":[0.0005, 0.0008, 0.001],
+    "decay_per_hour":[0.0008, 0.0015],
     "trend_spread_mult": [0],
-    "dd_threshold":  [1.0],
+    "dd_threshold":  [1.0, 1.5],
     "dd_factor":     [0.5],
-    "max_inv_ratio": [0.15, 0.20],
-    "initial_btc_pct": [0.20, 0.25],
-    "stop_loss":     [0.25],
+    "max_inv_ratio": [0.20, 0.35, 0.50, 0.70],
+    "initial_btc_pct": [0.30, 0.40, 0.50],
+    "stop_loss":     [0.25, 0.50],
     "rebalance_every": [0],
 }
-# 3*1*4*2*4*3*3*2*2 = 3456 configs
 GRID_TYPE = "geometric"
 
 CAPITAL = 100.0
