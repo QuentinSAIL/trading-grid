@@ -50,6 +50,16 @@ DD_FACTOR         = float(os.getenv("DD_FACTOR", 0.5))
 MAX_INV_RATIO     = float(os.getenv("MAX_INV_RATIO", 1.0))      # 1.0=off
 FEAR_GREED_ENABLED = os.getenv("FEAR_GREED_ENABLED", "false").lower() == "true"
 
+# Bear adaptive grid & dynamic inventory rebalance
+REBALANCE_EVERY   = int(os.getenv("REBALANCE_EVERY", 1))
+GRID_REFRESH_H    = int(os.getenv("GRID_REFRESH", 0))
+INV_TARGET        = float(os.getenv("INV_TARGET", 0.18))
+INV_TOLERANCE     = float(os.getenv("INV_TOLERANCE", 0.07))
+BEAR_THRESHOLD    = float(os.getenv("BEAR_THRESHOLD", -0.005))
+BEAR_SPREAD_MULT  = float(os.getenv("BEAR_SPREAD_MULT", 0.4))
+INITIAL_BTC_PCT   = float(os.getenv("INITIAL_BTC_PCT", 0.05))
+_GRID_REFRESH_HOURS = GRID_REFRESH_H if GRID_REFRESH_H > 0 else REBALANCE_EVERY
+
 DATA_DIR   = os.path.dirname(os.getenv("STATE_FILE", "/app/data/bot_state.json"))
 STATE_FILE = os.getenv("STATE_FILE", "/app/data/bot_state.json")
 LOG_FILE   = os.path.join(DATA_DIR, "bot.log")
@@ -299,6 +309,28 @@ def get_ema_trend(exchange) -> float:
         return 0.0
 
 
+def get_fast_ema_trend(exchange) -> float:
+    """Calcule le trend EMA rapide (3/8) pour decisions d'inventaire reactives."""
+    try:
+        ohlcv = exchange.fetch_ohlcv(SYMBOL, "1h", limit=10)
+        closes = [c[4] for c in ohlcv]
+        if len(closes) < 8:
+            return 0.0
+        ema3 = sum(closes[:3]) / 3
+        ema8 = sum(closes[:8]) / 8
+        k3 = 2 / (3 + 1)
+        k8 = 2 / (8 + 1)
+        for c in closes[8:]:
+            ema3 = c * k3 + ema3 * (1 - k3)
+            ema8 = c * k8 + ema8 * (1 - k8)
+        if ema8 > 0:
+            return (ema3 - ema8) / ema8
+        return 0.0
+    except Exception as e:
+        log.warning(f"Impossible de calculer fast EMA: {e}")
+        return 0.0
+
+
 def ema_multiplier(trend: float, side: str) -> float:
     """Multiplicateur EMA: favorise les ordres dans le sens de la tendance."""
     if EMA_STRENGTH == 0:
@@ -426,7 +458,7 @@ def adapt_spread(exchange) -> float:
 
 
 GRID_TYPE       = os.getenv("GRID_TYPE", "geometric")       # "linear" ou "geometric"
-WEIGHT_FACTOR   = float(os.getenv("WEIGHT_FACTOR", 3.0))    # 0=egal, 3=4x aux extremes
+WEIGHT_FACTOR   = float(os.getenv("WEIGHT_FACTOR", 1.5))    # 0=egal, 1.5=DCA modere
 RSI_PERIOD      = int(os.getenv("RSI_PERIOD", 14))
 RSI_STRENGTH    = float(os.getenv("RSI_STRENGTH", 1.0))     # 0=off, 1=normal, 2=agressif
 EMA_FAST        = int(os.getenv("EMA_FAST", 12))
@@ -447,17 +479,26 @@ def _weight_multiplier(level: int) -> float:
 
 
 def compute_grid(base_price: float, exchange,
-                 spread: float = None) -> list:
-    """Genere les niveaux buy/sell (geometrique + ponderes)."""
+                 spread: float = None, trend: float = 0.0) -> list:
+    """Genere les niveaux buy/sell (geometrique + ponderes).
+    TREND-AWARE: adapte spread et niveaux au regime de marche."""
     s = spread or GRID_SPREAD
+    active_levels = GRID_LEVELS
+    active_spread = s
+
+    # Bear adaptive grid: tighter spread + extra level
+    if trend < BEAR_THRESHOLD:
+        active_spread = max(GRID_SPREAD * 0.3, s * BEAR_SPREAD_MULT)
+        active_levels = max(1, GRID_LEVELS + 1)
+
     levels = []
-    for i in range(1, GRID_LEVELS + 1):
+    for i in range(1, active_levels + 1):
         if GRID_TYPE == "geometric":
-            buy_price = base_price * (1 - s) ** i
-            sell_price = base_price * (1 + s) ** i
+            buy_price = base_price * (1 - active_spread) ** i
+            sell_price = base_price * (1 + active_spread) ** i
         else:
-            buy_price = base_price * (1 - i * s)
-            sell_price = base_price * (1 + i * s)
+            buy_price = base_price * (1 - i * active_spread)
+            sell_price = base_price * (1 + i * active_spread)
         levels.append({
             "price": round_price(exchange, buy_price),
             "side": "buy",
@@ -515,12 +556,16 @@ def order_size(base_price: float, capital: float, exchange,
         if inv_ratio > 0.6:
             factor = max(0.1, 1.0 - (inv_ratio - 0.5) * 2)
             base_size_usdt *= factor
+        # Bear buy scaling: reduce buys in bear market
+        if trend < BEAR_THRESHOLD:
+            buy_scale = max(0.1, 1.0 + trend * 20)
+            base_size_usdt *= buy_scale
     else:
         if inv_ratio > 0.6:
             factor = min(2.0, 1.0 + (inv_ratio - 0.5) * 2)
             base_size_usdt *= factor
-        elif inv_ratio < 0.2:
-            factor = max(0.3, inv_ratio / 0.4)
+        elif inv_ratio < 0.3:
+            factor = max(0.2, inv_ratio / 0.5)
             base_size_usdt *= factor
 
     return round_amount(exchange, base_size_usdt / base_price)
@@ -621,6 +666,10 @@ def _process_fill(exchange, state: dict, oid: str, order: dict,
         trend = state.get("_last_trend", 0.0)
         eff_sp = effective_spread(trend)
 
+        # Counter-order inventory scaling (comme le backtester)
+        price_now = state.get("current_price", fill_price)
+        inv = inventory_ratio(state, price_now)
+
         if side == "buy":
             counter_price = round_price(exchange,
                                         fill_price * (1 + eff_sp))
@@ -633,6 +682,14 @@ def _process_fill(exchange, state: dict, oid: str, order: dict,
         else:
             counter_price = round_price(exchange,
                                         fill_price * (1 - eff_sp))
+            # Si trop de token, reduire le contre-achat
+            if inv > INV_TARGET + INV_TOLERANCE:
+                scale = max(0.2, 1.0 - (inv - INV_TARGET) * 3)
+                counter_size = round_amount(exchange, counter_size * scale)
+                if counter_size < min_amount:
+                    log.warning(f"Contre-achat trop petit apres scaling: "
+                                f"{counter_size} < min {min_amount}")
+                    return
             if counter_size * counter_price < min_cost:
                 log.warning(f"Contre-ordre sous cout min: "
                             f"{counter_size * counter_price:.2f} < {min_cost}")
@@ -712,7 +769,7 @@ def place_grid(exchange, state: dict, market_info: dict):
         notify(msg, color=0xff0000)
         raise SystemExit(msg)
 
-    grid = compute_grid(price, exchange, current_spread)
+    grid = compute_grid(price, exchange, current_spread, current_trend)
 
     ema_label = f"EMA:{current_trend:+.4f}" if EMA_STRENGTH > 0 else "EMA:off"
     bb_label = f"BB:{bb_sp*100:.2f}%" if BB_SPREAD_ADAPT else "BB:off"
@@ -892,7 +949,7 @@ def rebalance_grid(exchange, state: dict, new_price: float, market_info: dict):
         current_spread = current_spread * 0.7 + bb_sp * 0.3
 
     inv_r = inventory_ratio(state, new_price)
-    grid = compute_grid(new_price, exchange, current_spread)
+    grid = compute_grid(new_price, exchange, current_spread, current_trend)
 
     new_orders = dict(counter_orders)
     errors = 0
@@ -1137,6 +1194,37 @@ class PaperExchange:
                                 price: float) -> dict:
         return self._create_order("sell", symbol, amount, price)
 
+    def create_market_buy_order(self, symbol: str, amount: float) -> dict:
+        """Market buy au prix courant."""
+        price = self._last_price
+        cost = amount * price
+        if cost > self._usdt:
+            raise ccxt.InsufficientFunds(
+                f"Solde insuffisant pour market buy: "
+                f"besoin {cost:.2f}, disponible {self._usdt:.2f}")
+        self._usdt -= cost
+        self._btc += amount
+        oid = self._new_id()
+        result = {"id": oid, "status": "closed", "filled": amount,
+                  "average": price, "side": "buy"}
+        self._filled_orders[oid] = result
+        return result
+
+    def create_market_sell_order(self, symbol: str, amount: float) -> dict:
+        """Market sell au prix courant."""
+        price = self._last_price
+        if amount > self._btc:
+            raise ccxt.InsufficientFunds(
+                f"Solde insuffisant pour market sell: "
+                f"besoin {amount:.6f}, disponible {self._btc:.6f}")
+        self._btc -= amount
+        self._usdt += amount * price
+        oid = self._new_id()
+        result = {"id": oid, "status": "closed", "filled": amount,
+                  "average": price, "side": "sell"}
+        self._filled_orders[oid] = result
+        return result
+
     def fetch_open_orders(self, symbol: str) -> list:
         self._simulate_fills()
         return list(self.orders.values())
@@ -1313,6 +1401,27 @@ def main():
     vol = get_volatility(exchange)
     log.info(f"Volatilite 1h/24h: {vol:.3f}%")
 
+    # Initial BTC split (comme le backtester)
+    if (INITIAL_BTC_PCT > 0
+            and not state.get("_initial_split_done")
+            and not state.get("grid_orders")):
+        base_asset = SYMBOL.split("/")[0]
+        btc_to_buy_val = state["effective_capital"] * INITIAL_BTC_PCT
+        btc_to_buy = round_amount(exchange, btc_to_buy_val / init_price)
+        min_amt = market_info.get("min_amount", 0)
+        min_cst = market_info.get("min_cost", 0)
+        if (btc_to_buy >= min_amt and btc_to_buy * init_price >= min_cst):
+            try:
+                exchange.create_market_buy_order(SYMBOL, btc_to_buy)
+                fetch_balance(exchange, state, init_price)
+                state["_initial_split_done"] = True
+                log.info(f"Initial split: achete {btc_to_buy:.6f} "
+                         f"{base_asset} ({INITIAL_BTC_PCT*100:.1f}%)")
+            except Exception as e:
+                log.warning(f"Initial split echoue: {e}")
+        else:
+            state["_initial_split_done"] = True
+
     # Reprise ou placement initial
     if state.get("grid_orders") and state.get("grid_base_price"):
         log.info(f"Reprise grille existante "
@@ -1325,6 +1434,8 @@ def main():
 
     notify("**Grid Bot demarre**\nSurveillance toutes les 30s.")
     last_report_hour = None
+    last_rebalance_hour = None
+    last_grid_refresh_hour = None
 
     while True:
         try:
@@ -1342,8 +1453,126 @@ def main():
             price = get_current_price(exchange)
             state["current_price"] = price
 
-            # Stocker le trend pour les contre-ordres
+            # Stocker les bougies OHLCV pour le dashboard
+            try:
+                _ohlcv = exchange.fetch_ohlcv(SYMBOL, "5m", limit=100)
+                state["_candles"] = [
+                    {"t": c[0], "o": c[1], "h": c[2], "l": c[3], "c": c[4], "v": c[5]}
+                    for c in _ohlcv
+                ]
+            except Exception as _e:
+                log.warning(f"Impossible de fetcher les bougies pour le dashboard: {_e}")
+
+            # Stocker les indicateurs pour le dashboard
             state["_last_trend"] = get_ema_trend(exchange)
+            state["_last_fast_trend"] = get_fast_ema_trend(exchange)
+            state["_indicators"] = {
+                "rsi": get_rsi(exchange),
+                "ema_trend": state["_last_trend"],
+                "fast_ema_trend": state["_last_fast_trend"],
+                "volatility": get_volatility(exchange),
+                "bb_spread": get_bb_spread(exchange),
+                "fear_greed": get_fear_greed(),
+                "inventory_ratio": inventory_ratio(state, price),
+                "spread": _current_spread,
+                "rsi_period": RSI_PERIOD,
+                "rsi_strength": RSI_STRENGTH,
+                "ema_fast": EMA_FAST,
+                "ema_slow": EMA_SLOW,
+                "ema_strength": EMA_STRENGTH,
+                "bb_period": BB_PERIOD,
+                "bb_enabled": BB_SPREAD_ADAPT,
+                "fg_enabled": FEAR_GREED_ENABLED,
+                "grid_type": GRID_TYPE,
+                "grid_levels": GRID_LEVELS,
+                "base_spread": GRID_SPREAD,
+            }
+
+            # Dynamic inventory rebalance (comme le backtester)
+            now_ts = time.time()
+            current_hour = int(now_ts // 3600)
+            if (REBALANCE_EVERY > 0
+                    and last_rebalance_hour is not None
+                    and (current_hour - last_rebalance_hour) >= REBALANCE_EVERY):
+                last_rebalance_hour = current_hour
+                slow_trend = state.get("_last_trend", 0.0)
+                ft = state.get("_last_fast_trend", slow_trend)
+                t_sell = max(-0.05, min(0.05, ft))
+                t_buy = max(-0.05, min(0.05, slow_trend))
+                t = t_sell if ft < 0 else t_buy
+                trend_mult = 1.0 + t * 30
+                dynamic_target = max(0.01, min(0.30, INV_TARGET * trend_mult))
+
+                inv = inventory_ratio(state, price)
+                base_asset = SYMBOL.split("/")[0]
+                quote_asset = SYMBOL.split("/")[1]
+                balance = state.get("balance", {})
+
+                if inv > dynamic_target + INV_TOLERANCE:
+                    base_total = balance.get(base_asset, {}).get("free", 0)
+                    portfolio_val = state.get("portfolio_value", 0)
+                    target_token_val = portfolio_val * dynamic_target
+                    current_token_val = base_total * price
+                    excess_val = current_token_val - target_token_val
+                    if excess_val > 0:
+                        sell_amount = excess_val / price * 0.8
+                        sell_amount = round_amount(exchange, sell_amount)
+                        min_amt = market_info.get("min_amount", 0)
+                        min_cst = market_info.get("min_cost", 0)
+                        if (sell_amount >= min_amt
+                                and sell_amount * price >= min_cst
+                                and sell_amount <= base_total):
+                            try:
+                                exchange.create_market_sell_order(
+                                    SYMBOL, sell_amount)
+                                log.info(f"Rebalance SELL {sell_amount:.6f} "
+                                         f"{base_asset} (inv {inv:.2%} > "
+                                         f"target {dynamic_target:.2%})")
+                                fetch_balance(exchange, state, price)
+                            except Exception as e:
+                                log.warning(f"Rebalance sell error: {e}")
+
+                elif (inv < dynamic_target - INV_TOLERANCE
+                      and slow_trend > 0.01):
+                    portfolio_val = state.get("portfolio_value", 0)
+                    target_token_val = portfolio_val * dynamic_target
+                    base_total = balance.get(base_asset, {}).get("total", 0)
+                    current_token_val = base_total * price
+                    deficit_val = target_token_val - current_token_val
+                    available_quote = balance.get(
+                        quote_asset, {}).get("free", 0)
+                    if (deficit_val > 0
+                            and deficit_val < available_quote * 0.3):
+                        buy_amount = deficit_val / price * 0.5
+                        buy_amount = round_amount(exchange, buy_amount)
+                        cost = buy_amount * price
+                        min_amt = market_info.get("min_amount", 0)
+                        min_cst = market_info.get("min_cost", 0)
+                        if (buy_amount >= min_amt
+                                and cost >= min_cst
+                                and cost <= available_quote):
+                            try:
+                                exchange.create_market_buy_order(
+                                    SYMBOL, buy_amount)
+                                log.info(f"Rebalance BUY {buy_amount:.6f} "
+                                         f"{base_asset} (inv {inv:.2%} < "
+                                         f"target {dynamic_target:.2%})")
+                                fetch_balance(exchange, state, price)
+                            except Exception as e:
+                                log.warning(f"Rebalance buy error: {e}")
+            elif last_rebalance_hour is None:
+                last_rebalance_hour = current_hour
+
+            # Periodic grid refresh
+            if (last_grid_refresh_hour is not None
+                    and _GRID_REFRESH_HOURS > 0
+                    and (current_hour - last_grid_refresh_hour)
+                    >= _GRID_REFRESH_HOURS):
+                last_grid_refresh_hour = current_hour
+                log.info("Grid refresh periodique")
+                rebalance_grid(exchange, state, price, market_info)
+            elif last_grid_refresh_hour is None:
+                last_grid_refresh_hour = current_hour
 
             # Stale order decay: baisser le prix des contre-ordres ages
             if STALE_HOURS > 0:
