@@ -32,9 +32,9 @@ console = Console(force_terminal=True, width=250)
 # --- Parametres a tester ---
 
 PARAM_GRID = {
-    "spread":        [0.005, 0.006, 0.007, 0.008],
-    "levels":        [2, 3, 4],
-    "weight_factor": [-0.9, -0.5, 0, 0.5],
+    "spread":        [0.006, 0.008, 0.010, 0.012],
+    "levels":        [3, 4, 5],
+    "weight_factor": [-0.5, 0.0, 0.5],   # 0.0 = harvester neutre optimal
     "range_pct":     [0.04, 0.05],
     "rsi_period":    [14, 21],
     "rsi_strength":  [5.0, 7.0, 10.0],
@@ -49,7 +49,7 @@ PARAM_GRID = {
     "trend_spread_mult": [0],
     "dd_threshold":  [1.0, 1.5],
     "dd_factor":     [0.5],
-    "max_inv_ratio": [0.20, 0.35, 0.50, 0.70],
+    "max_inv_ratio": [0.20, 0.30, 0.50],
     "initial_btc_pct": [0.30, 0.40, 0.50],
     "stop_loss":     [0.25, 0.50],
     "rebalance_every": [0],

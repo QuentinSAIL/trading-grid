@@ -44,13 +44,13 @@ def parse_args():
     parser.add_argument("--capital", type=float, default=80,
                         help="Capital simule en USDT (defaut: 80)")
     parser.add_argument("--levels", type=int,
-                        default=int(os.getenv("GRID_LEVELS", 10)))
+                        default=int(os.getenv("GRID_LEVELS", 4)))
     parser.add_argument("--spread", type=float,
-                        default=float(os.getenv("GRID_SPREAD", 0.005)))
+                        default=float(os.getenv("GRID_SPREAD", 0.010)))
     parser.add_argument("--range-pct", type=float,
-                        default=float(os.getenv("PRICE_RANGE_PCT", 0.03)))
+                        default=float(os.getenv("PRICE_RANGE_PCT", 0.04)))
     parser.add_argument("--stop-loss", type=float,
-                        default=float(os.getenv("STOP_LOSS_PCT", 0.50)))
+                        default=float(os.getenv("STOP_LOSS_PCT", 0.25)))
     parser.add_argument("--maker-fee", type=float,
                         default=float(os.getenv("MAKER_FEE", 0.0)),
                         help="Frais maker (defaut: 0%% MEXC)")
@@ -62,14 +62,17 @@ def parse_args():
     parser.add_argument("--grid-type", default="geometric",
                         choices=["linear", "geometric"],
                         help="Type de grille (defaut: geometric)")
-    parser.add_argument("--weight-factor", type=float, default=1.5,
-                        help="Ponderation aux extremes: "
-                             "0=egal, 1=double, 2=triple (defaut: 1.5)")
+    parser.add_argument("--weight-factor", type=float,
+                        default=float(os.getenv("WEIGHT_FACTOR", 0.0)),
+                        help="Ponderation par niveau: 0=EGAL (harvester neutre "
+                             "optimal), <0=proche du prix, >0=aux extremes "
+                             "(defaut: 0.0)")
     parser.add_argument("--rsi-period", type=int, default=14,
                         help="Periode RSI (defaut: 14)")
-    parser.add_argument("--rsi-strength", type=float, default=1.0,
+    parser.add_argument("--rsi-strength", type=float,
+                        default=float(os.getenv("RSI_STRENGTH", 4.0)),
                         help="Force du signal RSI: "
-                             "0=off, 1=normal, 2=agressif (defaut: 1.0)")
+                             "0=off, 1=normal, 4=ultra agressif (defaut: 4.0)")
     parser.add_argument("--ema-fast", type=int,
                         default=int(os.getenv("EMA_FAST", 12)))
     parser.add_argument("--ema-slow", type=int,
@@ -83,7 +86,7 @@ def parse_args():
     parser.add_argument("--bb-mult", type=float,
                         default=float(os.getenv("BB_MULT", 2.0)),
                         help="Multiplicateur BB (defaut: 2.0)")
-    bb_default = os.getenv("BB_SPREAD_ADAPT", "false").lower() == "true"
+    bb_default = os.getenv("BB_SPREAD_ADAPT", "true").lower() == "true"
     parser.add_argument("--bb-spread", action="store_true",
                         default=bb_default,
                         help="Adapter le spread aux Bollinger Bands")
@@ -91,10 +94,10 @@ def parse_args():
                         default=False,
                         help="Desactiver adaptation BB spread")
     parser.add_argument("--stale-hours", type=int,
-                        default=int(os.getenv("STALE_HOURS", 0)),
+                        default=int(os.getenv("STALE_HOURS", 72)),
                         help="Heures avant decay des contre-ordres (0=off)")
     parser.add_argument("--decay-per-hour", type=float,
-                        default=float(os.getenv("DECAY_PER_HOUR", 0.0002)),
+                        default=float(os.getenv("DECAY_PER_HOUR", 0.0008)),
                         help="Reduction prix/h apres stale (defaut: 0.02%%)")
     parser.add_argument("--trend-spread-mult", type=float,
                         default=float(os.getenv("TREND_SPREAD_MULT", 0.0)),
@@ -106,23 +109,23 @@ def parse_args():
                         default=float(os.getenv("DD_FACTOR", 0.5)),
                         help="Facteur reduction si DD > seuil")
     parser.add_argument("--max-inv-ratio", type=float,
-                        default=float(os.getenv("MAX_INV_RATIO", 1.0)),
-                        help="Cap inventaire BTC (1.0=off)")
+                        default=float(os.getenv("MAX_INV_RATIO", 0.30)),
+                        help="Cap inventaire BTC (0.30=30%%, 1.0=off)")
     parser.add_argument("--initial-btc-pct", type=float,
-                        default=float(os.getenv("INITIAL_BTC_PCT", 0.5)),
-                        help="Part initiale en BTC (0.5=50/50)")
+                        default=float(os.getenv("INITIAL_BTC_PCT", 0.25)),
+                        help="Part initiale en BTC (0.25=25%%)")
     parser.add_argument("--trend-liquidation", type=float,
                         default=float(os.getenv("TREND_LIQUIDATION", 0.0)),
                         help="Seuil trend pour liquider BTC (0=off)")
     parser.add_argument("--rebalance-every", type=int,
-                        default=int(os.getenv("REBALANCE_EVERY", 6)),
+                        default=int(os.getenv("REBALANCE_EVERY", 1)),
                         help="Force rebalance inventory every N candles (0=off)")
     parser.add_argument("--grid-refresh", type=int,
                         default=int(os.getenv("GRID_REFRESH", 0)),
                         help="Force grid refresh every N candles (0=use rebalance-every)")
     parser.add_argument("--inv-target", type=float,
-                        default=float(os.getenv("INV_TARGET", 0.3)),
-                        help="Target inventory ratio (default: 0.3)")
+                        default=float(os.getenv("INV_TARGET", 0.18)),
+                        help="Target inventory ratio (default: 0.18)")
     parser.add_argument("--inv-tolerance", type=float,
                         default=float(os.getenv("INV_TOLERANCE", 0.10)),
                         help="Rebalance if inv deviates more than this from target")
@@ -132,7 +135,103 @@ def parse_args():
     parser.add_argument("--bear-spread-mult", type=float,
                         default=float(os.getenv("BEAR_SPREAD_MULT", 0.4)),
                         help="Spread multiplier in bear regime (default: 0.4)")
+    # --- Overlay tendance (optionnel) ---
+    to_default = os.getenv("TREND_OVERLAY", "false").lower() == "true"
+    parser.add_argument("--trend-overlay", action="store_true",
+                        default=to_default,
+                        help="Active le sleeve trend-following (chandelier) "
+                             "en plus du grid harvester")
+    parser.add_argument("--trend-weight", type=float,
+                        default=float(os.getenv("TREND_WEIGHT", 0.5)),
+                        help="Fraction du capital dans le sleeve trend (0-1)")
+    parser.add_argument("--chand-entry", type=int,
+                        default=int(os.getenv("CHAND_ENTRY", 168)),
+                        help="Lookback cassure Donchian en bougies (defaut 168)")
+    parser.add_argument("--chand-atr", type=float,
+                        default=float(os.getenv("CHAND_ATR_MULT", 2.5)),
+                        help="Multiplicateur du stop suiveur ATR (defaut 2.5)")
+    parser.add_argument("--chand-atr-lb", type=int,
+                        default=int(os.getenv("CHAND_ATR_LB", 48)),
+                        help="Lookback ATR en bougies (defaut 48)")
+    parser.add_argument("--portfolio", type=str,
+                        default=os.getenv("PORTFOLIO", ""),
+                        help="Backtest un PORTEFEUILLE multi-actifs equal-weight "
+                             "(harvester). Ex: --portfolio "
+                             "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT")
     return parser.parse_args()
+
+
+# --- OVERLAY TENDANCE (chandelier: cassure Donchian + stop suiveur ATR) -----
+
+def chandelier_alloc(candles: list, entry_lb: int, atr_mult: float,
+                     atr_lb: int) -> list:
+    """Allocation 0/1 trend-following, look-ahead-safe.
+    Entree: close casse le plus haut des `entry_lb` bougies precedentes.
+    Sortie: close passe sous le stop suiveur (plus haut - atr_mult*ATR)."""
+    n = len(candles)
+    closes = [c[4] for c in candles]
+    highs = [c[2] for c in candles]
+    lows = [c[3] for c in candles]
+    # True Range + ATR (Wilder), base sur la close precedente
+    atr = [0.0] * n
+    trs = [0.0] * n
+    trs[0] = highs[0] - lows[0]
+    for i in range(1, n):
+        pc = closes[i - 1]
+        trs[i] = max(highs[i] - lows[i], abs(highs[i] - pc), abs(lows[i] - pc))
+    if n > atr_lb:
+        atr[atr_lb] = sum(trs[1:atr_lb + 1]) / atr_lb
+        for i in range(atr_lb + 1, n):
+            atr[i] = (atr[i - 1] * (atr_lb - 1) + trs[i]) / atr_lb
+    alloc = [0.0] * n
+    pos = 0.0
+    hi_since = 0.0
+    trail = 0.0
+    for i in range(1, n):
+        # plus haut des entry_lb bougies precedentes (i-1 inclus)
+        lo = max(0, i - entry_lb)
+        prior_high = max(closes[lo:i]) if i > lo else closes[i - 1]
+        if pos == 0.0:
+            if closes[i] >= prior_high and atr[i] > 0:
+                pos = 1.0
+                hi_since = closes[i]
+                trail = closes[i] - atr_mult * atr[i]
+        else:
+            hi_since = max(hi_since, closes[i])
+            trail = max(trail, hi_since - atr_mult * atr[i])
+            if closes[i] < trail:
+                pos = 0.0
+        alloc[i] = pos
+    return alloc
+
+
+def simulate_trend_sleeve(candles: list, capital: float, alloc: list,
+                          taker_fee: float, band: float = 0.03) -> list:
+    """Simule le sleeve trend: rebalance vers `alloc` (decale d'1 bougie)
+    au close, avec frais taker et bande de tolerance. Retourne l'equity/bougie."""
+    n = len(candles)
+    cash = capital
+    coin = 0.0
+    equity = [0.0] * n
+    for t in range(n):
+        price = candles[t][4]
+        tgt = alloc[t - 1] if t > 0 else 0.0  # decalage anti look-ahead
+        port = cash + coin * price
+        cur = (coin * price) / port if port > 0 else 0.0
+        if abs(tgt - cur) > band:
+            delta = port * tgt - coin * price
+            if delta > 0:
+                buy = min(delta, cash)
+                fee = buy * taker_fee
+                coin += (buy - fee) / price
+                cash -= buy
+            elif delta < 0:
+                sell = min(-delta, coin * price)
+                fee = sell * taker_fee
+                coin -= sell / price
+                cash += sell - fee
+        equity[t] = cash + coin * price
+    return equity
 
 
 def fetch_candles(exchange, symbol: str, timeframe: str,
@@ -983,41 +1082,9 @@ def display_results(bt: GridBacktester, candles: list, args):
                             border_style="magenta"))
 
 
-def main():
-    args = parse_args()
-
-    console.print(Panel(
-        f"[bold cyan]Grid Backtester[/]\n"
-        f"[dim]{args.symbol} | {args.days} jours | "
-        f"{args.levels} niveaux | spread {args.spread*100:.2f}%[/]",
-        border_style="blue",
-    ))
-
-    try:
-        exchange_class = getattr(ccxt, args.exchange)
-        exchange = exchange_class({"enableRateLimit": True})
-        exchange.load_markets()
-    except Exception as e:
-        console.print(
-            f"[bold red]Erreur connexion {args.exchange}: {e}[/]")
-        sys.exit(1)
-
-    if args.symbol not in exchange.markets:
-        console.print(
-            f"[bold red]Paire {args.symbol} non disponible "
-            f"sur {args.exchange}[/]")
-        sys.exit(1)
-
-    candles = fetch_candles(exchange, args.symbol, args.timeframe, args.days)
-    if len(candles) < 10:
-        console.print(
-            "[bold red]Pas assez de donnees pour backtester[/]")
-        sys.exit(1)
-
-    console.print(f"[green]{len(candles)} bougies chargees[/]\n")
-
-    bt = GridBacktester(
-        capital=args.capital,
+def build_bt(capital: float, args) -> GridBacktester:
+    return GridBacktester(
+        capital=capital,
         levels=args.levels,
         spread=args.spread,
         range_pct=args.range_pct,
@@ -1049,6 +1116,225 @@ def main():
         bear_threshold=args.bear_threshold,
         bear_spread_mult=args.bear_spread_mult,
     )
+
+
+def display_blend_results(grid_eq, trend_eq, candles, args):
+    """Affiche les resultats du blend grid harvester + overlay trend."""
+    n = len(candles)
+    equity = [grid_eq[i] + trend_eq[i] for i in range(n)]
+    initial = args.capital
+    final_value = equity[-1]
+    pnl = final_value - initial
+    roi = pnl / initial * 100 if initial else 0
+    daily_roi = roi / args.days if args.days else 0
+    start_price = candles[0][1]
+    end_price = candles[-1][4]
+    hold_return = (end_price - start_price) / start_price * 100
+
+    # max drawdown + Sharpe (horaire annualise) sur l'equity combinee
+    peak = equity[0]
+    max_dd = 0.0
+    rets = []
+    for i in range(n):
+        peak = max(peak, equity[i])
+        dd = (peak - equity[i]) / peak if peak > 0 else 0
+        max_dd = max(max_dd, dd)
+        if i > 0 and equity[i - 1] > 0:
+            rets.append((equity[i] - equity[i - 1]) / equity[i - 1])
+    sharpe = 0.0
+    if len(rets) > 1:
+        avg = sum(rets) / len(rets)
+        var = sum((r - avg) ** 2 for r in rets) / len(rets)
+        std = math.sqrt(var)
+        if std > 0:
+            sharpe = avg / std * math.sqrt(24 * 365)
+
+    t = Table(show_header=False, expand=True, padding=(0, 1))
+    t.add_column("Metric", style="dim")
+    t.add_column("Valeur")
+    color = "green" if pnl >= 0 else "red"
+    t.add_row("Strategie", "Regime Harvest (grid + overlay trend chandelier)")
+    t.add_row("Repartition",
+              f"grid {(1-args.trend_weight)*100:.0f}% / trend {args.trend_weight*100:.0f}%")
+    t.add_row("Chandelier",
+              f"Donchian {args.chand_entry} | ATR {args.chand_atr_lb} x{args.chand_atr}")
+    t.add_row("", "")
+    t.add_row("Valeur finale", Text(f"{final_value:.2f} USDT", style="bold"))
+    t.add_row("PnL", Text(f"{pnl:+.2f} USDT", style=f"bold {color}"))
+    t.add_row("ROI", Text(f"{roi:+.2f}%", style=f"bold {color}"))
+    t.add_row("ROI/jour", Text(f"{daily_roi:+.3f}%/j", style=color))
+    t.add_row("ROI projete/mois", Text(f"{daily_roi*30:+.2f}%/mois", style=color))
+    t.add_row("Max drawdown", Text(f"{max_dd*100:.2f}%", style="yellow"))
+    t.add_row("Sharpe (annualise)", f"{sharpe:+.2f}")
+    t.add_row("", "")
+    t.add_row("Buy & Hold", Text(f"{hold_return:+.2f}%", style="cyan"))
+    vs = roi - hold_return
+    t.add_row("vs Hold", Text(f"{vs:+.2f}%",
+                              style="green" if vs >= 0 else "red"))
+    console.print(Panel(t, title="[bold]Resultats — Regime Harvest[/bold]",
+                        border_style="green"))
+    console.print(
+        "[dim]Note: l'overlay trend augmente le rendement en marche haussier "
+        "mais reduit la robustesse hors-echantillon (pari directionnel long). "
+        "Le grid harvester seul (sans --trend-overlay) est plus robuste.[/dim]")
+
+
+def run_portfolio(exchange, args):
+    """Backtest un portefeuille multi-actifs equal-weight (harvester par actif)."""
+    symbols = [s.strip() for s in args.portfolio.split(",") if s.strip()]
+    if not symbols:
+        console.print("[red]--portfolio vide[/]")
+        sys.exit(1)
+    per_cap = args.capital / len(symbols)
+    sleeves = []  # (symbol, equity_list, roi, bh)
+    for sym in symbols:
+        if sym not in exchange.markets:
+            console.print(f"[yellow]Skip {sym}: indisponible sur {args.exchange}[/]")
+            continue
+        candles = fetch_candles(exchange, sym, args.timeframe, args.days)
+        if len(candles) < 50:
+            console.print(f"[yellow]Skip {sym}: pas assez de donnees[/]")
+            continue
+        bt = build_bt(per_cap, args)
+        eq = []
+        for c in candles:
+            bt.process_candle(c)
+            eq.append(bt.capital + bt.btc_held * c[4])
+        bh = (candles[-1][4] - candles[0][1]) / candles[0][1] * 100
+        sleeves.append((sym, eq, bh, candles[0][0]))
+
+    if not sleeves:
+        console.print("[red]Aucun actif backteste[/]")
+        sys.exit(1)
+
+    minlen = min(len(eq) for _, eq, _, _ in sleeves)
+    n = minlen
+    combined = [0.0] * n
+    for _, eq, _, _ in sleeves:
+        tail = eq[-n:]
+        for i in range(n):
+            combined[i] += tail[i]
+
+    initial = args.capital
+    final_value = combined[-1]
+    pnl = final_value - initial
+    roi = pnl / initial * 100 if initial else 0
+    daily_roi = roi / args.days if args.days else 0
+    bh = sum(s[2] for s in sleeves) / len(sleeves)
+
+    # DD + Sharpe
+    peak = combined[0]
+    max_dd = 0.0
+    rets = []
+    for i in range(n):
+        peak = max(peak, combined[i])
+        dd = (peak - combined[i]) / peak if peak > 0 else 0
+        max_dd = max(max_dd, dd)
+        if i > 0 and combined[i - 1] > 0:
+            rets.append((combined[i] - combined[i - 1]) / combined[i - 1])
+    sharpe = 0.0
+    if len(rets) > 1:
+        avg = sum(rets) / len(rets)
+        std = math.sqrt(sum((r - avg) ** 2 for r in rets) / len(rets))
+        if std > 0:
+            sharpe = avg / std * math.sqrt(24 * 365)
+
+    color = "green" if pnl >= 0 else "red"
+    t = Table(show_header=False, expand=True, padding=(0, 1))
+    t.add_column("Metric", style="dim"); t.add_column("Valeur")
+    t.add_row("Strategie", "Portefeuille multi-actifs (Robust Harvester)")
+    t.add_row("Actifs", f"{len(sleeves)} x {per_cap:.2f} USDT")
+    t.add_row("Periode", f"{args.days} jours ({args.timeframe})")
+    t.add_row("", "")
+    t.add_row("Valeur finale", Text(f"{final_value:.2f} USDT", style="bold"))
+    t.add_row("PnL", Text(f"{pnl:+.2f} USDT", style=f"bold {color}"))
+    t.add_row("ROI", Text(f"{roi:+.2f}%", style=f"bold {color}"))
+    t.add_row("ROI/jour", Text(f"{daily_roi:+.3f}%/j", style=color))
+    t.add_row("Max drawdown", Text(f"{max_dd*100:.2f}%", style="yellow"))
+    t.add_row("Sharpe (annualise)", f"{sharpe:+.2f}")
+    t.add_row("", "")
+    t.add_row("Buy & Hold moyen", Text(f"{bh:+.2f}%", style="cyan"))
+    vs = roi - bh
+    t.add_row("vs Hold", Text(f"{vs:+.2f}%", style="green" if vs >= 0 else "red"))
+    console.print(Panel(t, title="[bold]Resultats — Portefeuille[/bold]",
+                        border_style="green"))
+
+    # per-asset breakdown
+    pa = Table(show_header=True, header_style="bold", expand=True)
+    pa.add_column("Actif"); pa.add_column("ROI", justify="right")
+    pa.add_column("B&H", justify="right")
+    for sym, eq, bh_a, _ in sleeves:
+        r = (eq[-1] - per_cap) / per_cap * 100
+        c = "green" if r >= 0 else "red"
+        pa.add_row(sym, Text(f"{r:+.1f}%", style=c), f"{bh_a:+.1f}%")
+    console.print(Panel(pa, title="[bold]Par actif[/bold]", border_style="blue"))
+    console.print(
+        "[dim]Note: equal-weight, harvester par actif. La diversification "
+        "ameliore fortement le Sharpe. Deployer via N instances du bot "
+        "(1 par SYMBOL) — voir README.[/dim]")
+
+
+def main():
+    args = parse_args()
+
+    console.print(Panel(
+        f"[bold cyan]Grid Backtester[/]\n"
+        f"[dim]{args.symbol} | {args.days} jours | "
+        f"{args.levels} niveaux | spread {args.spread*100:.2f}%[/]",
+        border_style="blue",
+    ))
+
+    try:
+        exchange_class = getattr(ccxt, args.exchange)
+        exchange = exchange_class({"enableRateLimit": True})
+        exchange.load_markets()
+    except Exception as e:
+        console.print(
+            f"[bold red]Erreur connexion {args.exchange}: {e}[/]")
+        sys.exit(1)
+
+    if args.portfolio:
+        console.print()
+        run_portfolio(exchange, args)
+        return
+
+    if args.symbol not in exchange.markets:
+        console.print(
+            f"[bold red]Paire {args.symbol} non disponible "
+            f"sur {args.exchange}[/]")
+        sys.exit(1)
+
+    candles = fetch_candles(exchange, args.symbol, args.timeframe, args.days)
+    if len(candles) < 10:
+        console.print(
+            "[bold red]Pas assez de donnees pour backtester[/]")
+        sys.exit(1)
+
+    console.print(f"[green]{len(candles)} bougies chargees[/]\n")
+
+    if args.trend_overlay:
+        # Blend: grid harvester sur (1-w) du capital + sleeve trend sur w
+        w = max(0.0, min(1.0, args.trend_weight))
+        grid_cap = args.capital * (1 - w)
+        trend_cap = args.capital * w
+        bt = build_bt(grid_cap, args)
+        grid_eq = []
+        with Progress(console=console) as progress:
+            task = progress.add_task("[cyan]Simulation grid harvester...",
+                                     total=len(candles))
+            for candle in candles:
+                bt.process_candle(candle)
+                grid_eq.append(bt.capital + bt.btc_held * candle[4])
+                progress.advance(task)
+        alloc = chandelier_alloc(candles, args.chand_entry,
+                                 args.chand_atr, args.chand_atr_lb)
+        trend_eq = simulate_trend_sleeve(candles, trend_cap, alloc,
+                                         args.taker_fee)
+        console.print()
+        display_blend_results(grid_eq, trend_eq, candles, args)
+        return
+
+    bt = build_bt(args.capital, args)
 
     with Progress(console=console) as progress:
         task = progress.add_task("[cyan]Simulation...",

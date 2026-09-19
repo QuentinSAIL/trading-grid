@@ -29,11 +29,12 @@ API_KEY         = os.getenv("API_KEY", "")
 API_SECRET      = os.getenv("API_SECRET", "")
 SYMBOL          = os.getenv("SYMBOL", "BTC/USDT")
 CAPITAL_ALLOC   = float(os.getenv("CAPITAL_ALLOCATION", 90))  # % du portefeuille
+FIXED_CAPITAL   = float(os.getenv("FIXED_CAPITAL", 0))        # >0 = budget fixe USDT (mode portefeuille multi-instances)
 MIN_CAPITAL     = float(os.getenv("MIN_CAPITAL", 30))         # minimum USDT pour trader
-GRID_LEVELS     = int(os.getenv("GRID_LEVELS", 8))
-GRID_SPREAD     = float(os.getenv("GRID_SPREAD", 0.003))
-PRICE_RANGE_PCT = float(os.getenv("PRICE_RANGE_PCT", 0.03))
-STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", 0.50))
+GRID_LEVELS     = int(os.getenv("GRID_LEVELS", 4))
+GRID_SPREAD     = float(os.getenv("GRID_SPREAD", 0.010))
+PRICE_RANGE_PCT = float(os.getenv("PRICE_RANGE_PCT", 0.04))
+STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", 0.25))
 MAX_OPEN_ORDERS = int(os.getenv("MAX_OPEN_ORDERS", 20))
 MAKER_FEE       = float(os.getenv("MAKER_FEE", 0.0))    # 0% maker (MEXC)
 TAKER_FEE       = float(os.getenv("TAKER_FEE", 0.001))   # 0.1% taker (MEXC)
@@ -42,12 +43,12 @@ DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 PAPER_TRADING   = os.getenv("PAPER_TRADING", "true").lower() == "true"
 
 # Nouvelles features
-STALE_HOURS       = int(os.getenv("STALE_HOURS", 0))           # 0=off
-DECAY_PER_HOUR    = float(os.getenv("DECAY_PER_HOUR", 0.0002))
+STALE_HOURS       = int(os.getenv("STALE_HOURS", 72))          # 0=off
+DECAY_PER_HOUR    = float(os.getenv("DECAY_PER_HOUR", 0.0008))
 TREND_SPREAD_MULT = float(os.getenv("TREND_SPREAD_MULT", 0.0)) # 0=off
 DD_THRESHOLD      = float(os.getenv("DD_THRESHOLD", 1.0))       # 1.0=off
 DD_FACTOR         = float(os.getenv("DD_FACTOR", 0.5))
-MAX_INV_RATIO     = float(os.getenv("MAX_INV_RATIO", 1.0))      # 1.0=off
+MAX_INV_RATIO     = float(os.getenv("MAX_INV_RATIO", 0.30))     # 30% cap (protection bear)
 FEAR_GREED_ENABLED = os.getenv("FEAR_GREED_ENABLED", "false").lower() == "true"
 
 # Bear adaptive grid & dynamic inventory rebalance
@@ -57,7 +58,7 @@ INV_TARGET        = float(os.getenv("INV_TARGET", 0.18))
 INV_TOLERANCE     = float(os.getenv("INV_TOLERANCE", 0.07))
 BEAR_THRESHOLD    = float(os.getenv("BEAR_THRESHOLD", -0.005))
 BEAR_SPREAD_MULT  = float(os.getenv("BEAR_SPREAD_MULT", 0.4))
-INITIAL_BTC_PCT   = float(os.getenv("INITIAL_BTC_PCT", 0.05))
+INITIAL_BTC_PCT   = float(os.getenv("INITIAL_BTC_PCT", 0.25))
 _GRID_REFRESH_HOURS = GRID_REFRESH_H if GRID_REFRESH_H > 0 else REBALANCE_EVERY
 
 DATA_DIR   = os.path.dirname(os.getenv("STATE_FILE", "/app/data/bot_state.json"))
@@ -213,7 +214,12 @@ def fetch_balance(exchange, state: dict, price: float = None):
 
     p = price or state.get("current_price") or state.get("grid_base_price") or 0
     portfolio_value = q["total"] + b["total"] * p
-    effective_capital = portfolio_value * CAPITAL_ALLOC / 100
+    if FIXED_CAPITAL > 0:
+        # Mode portefeuille multi-instances: budget fixe par bot (1 par SYMBOL,
+        # meme compte). Evite que chaque instance reclame % du solde partage.
+        effective_capital = min(FIXED_CAPITAL, portfolio_value)
+    else:
+        effective_capital = portfolio_value * CAPITAL_ALLOC / 100
 
     state["portfolio_value"] = round(portfolio_value, 4)
     state["effective_capital"] = round(effective_capital, 4)
@@ -458,15 +464,15 @@ def adapt_spread(exchange) -> float:
 
 
 GRID_TYPE       = os.getenv("GRID_TYPE", "geometric")       # "linear" ou "geometric"
-WEIGHT_FACTOR   = float(os.getenv("WEIGHT_FACTOR", 1.5))    # 0=egal, 1.5=DCA modere
+WEIGHT_FACTOR   = float(os.getenv("WEIGHT_FACTOR", 0.0))    # 0=sizing EGAL (harvester neutre optimal)
 RSI_PERIOD      = int(os.getenv("RSI_PERIOD", 14))
-RSI_STRENGTH    = float(os.getenv("RSI_STRENGTH", 1.0))     # 0=off, 1=normal, 2=agressif
+RSI_STRENGTH    = float(os.getenv("RSI_STRENGTH", 4.0))     # 0=off, 1=normal, 4=ultra agressif
 EMA_FAST        = int(os.getenv("EMA_FAST", 12))
 EMA_SLOW        = int(os.getenv("EMA_SLOW", 26))
 EMA_STRENGTH    = float(os.getenv("EMA_STRENGTH", 0.0))     # 0=off, 1=normal, 2=agressif
 BB_PERIOD       = int(os.getenv("BB_PERIOD", 20))
 BB_MULT         = float(os.getenv("BB_MULT", 2.0))
-BB_SPREAD_ADAPT = os.getenv("BB_SPREAD_ADAPT", "false").lower() == "true"
+BB_SPREAD_ADAPT = os.getenv("BB_SPREAD_ADAPT", "true").lower() == "true"
 
 
 def _weight_multiplier(level: int) -> float:

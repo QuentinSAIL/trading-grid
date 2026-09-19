@@ -1,0 +1,92 @@
+# Deploiement PORTEFEUILLE multi-actifs (Robust Harvester diversifie).
+# 7 instances du bot, une par actif, sur le MEME compte exchange.
+#
+#   FIXED_CAPITAL_EACH = budget USDT alloue a CHAQUE instance (defaut 25).
+#   Total deploye ~= 7 x FIXED_CAPITAL_EACH. Assure-toi d'avoir ce solde USDT.
+#
+# Backtest du portefeuille avant de lancer:
+#   python backtest.py 800 --portfolio BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT,LINK/USDT,LTC/USDT
+#
+# Lancer:  docker compose -f docker-compose.portfolio.yml up -d
+#
+# NOTE: sur un seul compte, les instances partagent le solde USDT (le mode
+# FIXED_CAPITAL empeche la sur-allocation). Pour un cloisonnement strict,
+# utilise des sous-comptes / cles API distinctes par instance.
+
+x-bot: &bot
+  image: ${REGISTRY_URL}/trading-grid:latest
+  restart: unless-stopped
+  stop_grace_period: 30s
+  env_file:
+    - .env
+  volumes:
+    - ./data:/app/data
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  bot-btc:
+    <<: *bot
+    container_name: grid-btc
+    environment:
+      - SYMBOL=BTC/USDT
+      - STATE_FILE=/app/data/state_btc.json
+      - FIXED_CAPITAL=${FIXED_CAPITAL_EACH:-25}
+      - MIN_CAPITAL=5
+
+  bot-eth:
+    <<: *bot
+    container_name: grid-eth
+    environment:
+      - SYMBOL=ETH/USDT
+      - STATE_FILE=/app/data/state_eth.json
+      - FIXED_CAPITAL=${FIXED_CAPITAL_EACH:-25}
+      - MIN_CAPITAL=5
+
+  bot-sol:
+    <<: *bot
+    container_name: grid-sol
+    environment:
+      - SYMBOL=SOL/USDT
+      - STATE_FILE=/app/data/state_sol.json
+      - FIXED_CAPITAL=${FIXED_CAPITAL_EACH:-25}
+      - MIN_CAPITAL=5
+
+  bot-bnb:
+    <<: *bot
+    container_name: grid-bnb
+    environment:
+      - SYMBOL=BNB/USDT
+      - STATE_FILE=/app/data/state_bnb.json
+      - FIXED_CAPITAL=${FIXED_CAPITAL_EACH:-25}
+      - MIN_CAPITAL=5
+
+  bot-xrp:
+    <<: *bot
+    container_name: grid-xrp
+    environment:
+      - SYMBOL=XRP/USDT
+      - STATE_FILE=/app/data/state_xrp.json
+      - FIXED_CAPITAL=${FIXED_CAPITAL_EACH:-25}
+      - MIN_CAPITAL=5
+
+  bot-link:
+    <<: *bot
+    container_name: grid-link
+    environment:
+      - SYMBOL=LINK/USDT
+      - STATE_FILE=/app/data/state_link.json
+      - FIXED_CAPITAL=${FIXED_CAPITAL_EACH:-25}
+      - MIN_CAPITAL=5
+
+  bot-ltc:
+    <<: *bot
+    container_name: grid-ltc
+    environment:
+      - SYMBOL=LTC/USDT
+      - STATE_FILE=/app/data/state_ltc.json
+      - FIXED_CAPITAL=${FIXED_CAPITAL_EACH:-25}
+      - MIN_CAPITAL=5
