@@ -158,6 +158,11 @@ def parse_args():
                         help="Backtest un PORTEFEUILLE multi-actifs equal-weight "
                              "(harvester). Ex: --portfolio "
                              "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT")
+    parser.add_argument("--leverage", type=float,
+                        default=float(os.getenv("LEVERAGE", 1.0)),
+                        help="Levier constant (futures) applique a l'equity du "
+                             "portefeuille. 1.5 vise ~0.2%%/j lisse. IGNORE le "
+                             "funding et le slippage de liquidation — a valider.")
     return parser.parse_args()
 
 
@@ -282,7 +287,8 @@ class GridBacktester:
                  initial_btc_pct=0.5, trend_liquidation=0.0,
                  rebalance_every=0, grid_refresh=0,
                  inv_target=0.3, inv_tolerance=0.10,
-                 bear_threshold=-0.005, bear_spread_mult=0.4):
+                 bear_threshold=-0.005, bear_spread_mult=0.4,
+                 inv_target_max=0.30):
         self.initial_capital = capital
         self.capital = capital    # USDT disponible
         self.levels = levels
@@ -318,6 +324,7 @@ class GridBacktester:
         self.bear_spread_mult = bear_spread_mult
         self.inv_target = inv_target            # ratio cible d'inventaire token
         self.inv_tolerance = inv_tolerance      # seuil de deviation pour rebalance
+        self.inv_target_max = inv_target_max    # plafond cible en bull (regime-scale)
 
         self.grid_orders = {}
         self._candle_count = 0
@@ -881,7 +888,7 @@ class GridBacktester:
                 t_buy = max(-0.05, min(0.05, self.trend))
                 t = t_sell if ft < 0 else t_buy
                 trend_mult = 1.0 + t * 30
-                dynamic_target = max(0.01, min(0.30, self.inv_target * trend_mult))
+                dynamic_target = max(0.01, min(self.inv_target_max, self.inv_target * trend_mult))
 
             inv = self._inventory_ratio(c)
             if inv > dynamic_target + self.inv_tolerance:
@@ -1215,6 +1222,24 @@ def run_portfolio(exchange, args):
         for i in range(n):
             combined[i] += tail[i]
 
+    # Levier constant (futures) — proxy: rendement/barre x L. Liquidation si
+    # une barre fait <= -1/L. Ignore funding + slippage de liquidation.
+    liquidated = False
+    if args.leverage and args.leverage != 1.0:
+        L = args.leverage
+        lev = [0.0] * n
+        lev[0] = args.capital
+        for i in range(1, n):
+            r = (combined[i] - combined[i - 1]) / combined[i - 1] if combined[i - 1] > 0 else 0
+            rr = L * r
+            if rr <= -1.0:
+                for j in range(i, n):
+                    lev[j] = 0.0
+                liquidated = True
+                break
+            lev[i] = lev[i - 1] * (1 + rr)
+        combined = lev
+
     initial = args.capital
     final_value = combined[-1]
     pnl = final_value - initial
@@ -1245,6 +1270,10 @@ def run_portfolio(exchange, args):
     t.add_row("Strategie", "Portefeuille multi-actifs (Robust Harvester)")
     t.add_row("Actifs", f"{len(sleeves)} x {per_cap:.2f} USDT")
     t.add_row("Periode", f"{args.days} jours ({args.timeframe})")
+    if args.leverage and args.leverage != 1.0:
+        lev_style = "bold red" if liquidated else "yellow"
+        lev_txt = f"x{args.leverage}" + (" — LIQUIDE!" if liquidated else " (futures)")
+        t.add_row("Levier", Text(lev_txt, style=lev_style))
     t.add_row("", "")
     t.add_row("Valeur finale", Text(f"{final_value:.2f} USDT", style="bold"))
     t.add_row("PnL", Text(f"{pnl:+.2f} USDT", style=f"bold {color}"))
@@ -1272,6 +1301,12 @@ def run_portfolio(exchange, args):
         "[dim]Note: equal-weight, harvester par actif. La diversification "
         "ameliore fortement le Sharpe. Deployer via N instances du bot "
         "(1 par SYMBOL) — voir README.[/dim]")
+    if args.leverage and args.leverage != 1.0:
+        console.print(
+            f"[yellow]Levier x{args.leverage}: modele constant-leverage, IGNORE "
+            f"le funding (~0.01-0.1%/8h de drag reel) et le slippage de "
+            f"liquidation. Exige des FUTURES/margin — risque de liquidation "
+            f"reel. A valider avant tout deploiement live.[/yellow]")
 
 
 def main():

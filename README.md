@@ -104,6 +104,41 @@ Le mode `FIXED_CAPITAL` (budget fixe par bot) empêche les instances de se
 disputer le solde USDT partagé. Pour un cloisonnement strict, utilise des
 sous-comptes / clés API distinctes par actif.
 
+## Viser 0.2 %/jour : la frontière honnête
+
+Objectif ambitieux (≈73 %/an). Après avoir écarté par **sweep** tous les leviers
+"gratuits" — timeframe fin (pire : le bear s'effondre), spread serré (pire),
+plafond d'inventaire haut (neutre) — le constat est net : **en spot pur, la
+récolte de volatilité plafonne vers ~0.12–0.14 %/jour** sur la fenêtre longue.
+C'est une limite structurelle, pas un manque d'optimisation.
+
+Le seul chemin vers 0.2 %/jour lissé est le **levier** (futures) :
+
+| Config (7 actifs) | 90j | 365j (bear) | 800j (lissé) | Max DD | Liquidation |
+|---|---|---|---|---|---|
+| spot x1 | 0.084 %/j | 0.027 %/j | 0.120 %/j | 9 % | — |
+| **futures x1.5** | 0.128 %/j | 0.041 %/j | **0.211 %/j** | 13 % | aucune (backtest) |
+| futures x2.0 | 0.174 %/j | 0.055 %/j | 0.327 %/j | 17 % | aucune (backtest) |
+| 10 actifs spot x1 | 0.104 %/j | 0.024 %/j | 0.138 %/j | 11 % | — |
+
+Le harvester est un **excellent candidat au levier** : sa volatilité par barre est
+très basse (inventaire faible + diversification), si bien qu'aucune liquidation
+n'apparaît même à 3× en backtest — contrairement au buy & hold qui exploserait.
+
+**Backtester avec levier :**
+```bash
+python backtest.py 800 --portfolio BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT,LINK/USDT,LTC/USDT --leverage 1.5
+```
+
+⚠️ **Honnêteté brutale** : le levier exige des **futures/margin** (risque de
+**liquidation réel**), et le modèle de backtest **ignore les frais de funding**
+(~0.01–0.1 %/8 h, un drag réel qui ronge le rendement) et le slippage de
+liquidation. Le 800j reste aussi gonflé par le bull des alts + les fills 1h
+optimistes. En clair : **0.2 %/jour n'est atteignable qu'en acceptant un profil
+de risque futures** — jamais en spot. Aucune fenêtre n'atteint 0.2 %/jour dans le
+bear 365j (le meilleur est ~0.08 %/j à 3×). Le bot live reste **spot par défaut** ;
+une version futures leveragée n'est pas activée sans décision explicite.
+
 ## Honnêteté / limites (lis ça)
 
 La stratégie a été soumise à une validation adverse (audit look-ahead, stress
