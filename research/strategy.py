@@ -20,16 +20,17 @@ from backtest import GridBacktester
 
 WINDOWS = [90, 180, 365, 800]
 
-# Sleeve A grid params (current proven .env.example config)
+# Production "Robust Harvester" config (aligned with .env.example / backtest.py).
+# Key lever vs the old grid: weight_factor 0.0 (equal per-level sizing).
 GRID_PARAMS = dict(
-    levels=3, spread=0.008, range_pct=0.04, stop_loss_pct=0.25,
-    maker_fee=0.0, taker_fee=0.001, grid_type="geometric", weight_factor=-0.9,
+    levels=4, spread=0.010, range_pct=0.04, stop_loss_pct=0.25,
+    maker_fee=0.0, taker_fee=0.001, grid_type="geometric", weight_factor=0.0,
     rsi_period=14, rsi_strength=4.0, ema_fast=12, ema_slow=26,
     ema_strength=0.0, bb_period=20, bb_mult=2.0, bb_spread_adapt=True,
     stale_hours=72, decay_per_hour=0.0008, trend_spread_mult=0.0,
-    dd_threshold=1.0, dd_factor=0.5, max_inv_ratio=0.20,
+    dd_threshold=1.0, dd_factor=0.5, max_inv_ratio=0.30,
     initial_btc_pct=0.25, rebalance_every=1, grid_refresh=0,
-    inv_target=0.18, inv_tolerance=0.07,
+    inv_target=0.18, inv_tolerance=0.07, inv_target_max=0.30,
 )
 
 # Sleeve B chandelier params

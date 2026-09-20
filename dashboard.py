@@ -29,10 +29,34 @@ from rich.text import Text
 
 load_dotenv()
 
-STATE_FILE = sys.argv[1] if len(sys.argv) > 1 else os.getenv("STATE_FILE", "data/bot_state.json")
+import glob
+
+STATE_ARG = sys.argv[1] if len(sys.argv) > 1 else os.getenv("STATE_FILE", "data/bot_state.json")
 SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
-GRID_SPREAD = float(os.getenv("GRID_SPREAD", 0.005))
+GRID_SPREAD = float(os.getenv("GRID_SPREAD", 0.010))
 REFRESH_INTERVAL = 2
+
+
+def discover_state_files(arg: str):
+    """Portfolio mode: return {label: path} if arg points to a directory or a
+    glob matching several state files (deploiement multi-instances), else None."""
+    paths = []
+    if os.path.isdir(arg):
+        paths = sorted(glob.glob(os.path.join(arg, "state_*.json")))
+    elif "*" in arg:
+        paths = sorted(glob.glob(arg))
+    if len(paths) >= 2:
+        out = {}
+        for p in paths:
+            label = (os.path.basename(p).replace("state_", "")
+                     .replace(".json", "").replace("bot_state", "bot").upper())
+            out[label] = p
+        return out
+    return None
+
+
+# In single mode STATE_FILE is the one file to read.
+STATE_FILE = STATE_ARG
 
 # ── Braille chart characters ─────────────────────────────────────────
 # Each braille char encodes a 2x4 dot grid. We use columns of 4 rows.
@@ -43,12 +67,22 @@ BRAILLE_DOTS = [
 ]
 
 
-def load_state() -> dict | None:
+def load_state(path: str = None) -> dict | None:
     try:
-        with open(STATE_FILE) as f:
+        with open(path or STATE_FILE) as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return None
+
+
+def load_all_states(paths: dict) -> dict:
+    """{label: path} -> {label: state} (skips unreadable files)."""
+    out = {}
+    for label, p in paths.items():
+        st = load_state(p)
+        if st is not None:
+            out[label] = st
+    return out
 
 
 def format_elapsed(start_time_str: str) -> str:
@@ -374,8 +408,8 @@ def build_header(state: dict) -> Panel:
     h.append(f"\n  {pnl_arrow} PnL ", style=f"bold {pnl_color}")
     h.append(f"{portfolio_pnl:+,.2f} USDT ", style=f"bold {pnl_color}")
     h.append(f"({portfolio_roi:+.2f}%)", style=f"{pnl_color}")
-    h.append(f"   Grid ", style="dim")
-    h.append(f"{grid_profit:+.4f}", style=f"bold {grid_color}")
+    h.append(f"   Cycles(brut) ", style="dim")
+    h.append(f"{grid_profit:+.2f}", style=f"dim {grid_color}")
     h.append(f"   Trades ", style="dim")
     h.append(f"{trades}", style="bold bright_white")
     h.append(f"   Ordres ", style="dim")
@@ -395,7 +429,10 @@ def build_header(state: dict) -> Panel:
     h.append("░" * (bar_len - filled), style="bright_black")
     h.append(f"] {alloc:.0f}%", style="dim")
 
-    return Panel(h, title="[bold bright_white] GRID TRADING BOT [/bold bright_white]", border_style="bright_blue", subtitle=f"[dim]{STATE_FILE}[/dim]")
+    cap_mode = "budget fixe" if float(os.getenv("FIXED_CAPITAL", 0)) > 0 else f"{alloc:.0f}%"
+    return Panel(h, title="[bold bright_white] ROBUST HARVESTER [/bold bright_white]",
+                 border_style="bright_blue",
+                 subtitle=f"[dim]{SYMBOL}  ·  {cap_mode}  ·  {STATE_FILE}[/dim]")
 
 
 def build_grid_visual(state: dict) -> Panel:
@@ -535,9 +572,10 @@ def build_fills_table(state: dict) -> Panel:
     if not recent:
         table.add_row("", "", "", Text("En attente...", style="dim italic"), "", "")
 
-    total_profit = sum(f.get("profit", 0) for f in fills if f.get("profit", 0) > 0)
+    total_profit = sum(f.get("profit", 0) for f in fills)
     profit_color = "green" if total_profit >= 0 else "red"
-    subtitle = f"[dim]Total: {len(fills)} fills  |  Profit cumule: [{profit_color}]{total_profit:+.4f}[/{profit_color}][/dim]"
+    subtitle = (f"[dim]Total: {len(fills)} fills  |  PnL cycles (brut, indicatif): "
+                f"[{profit_color}]{total_profit:+.2f}[/{profit_color}][/dim]")
     return Panel(table, title="[bold] Derniers fills [/bold]", subtitle=subtitle, border_style="magenta")
 
 
@@ -925,6 +963,87 @@ def build_indicators_panel(state: dict) -> Panel:
     return Panel(t, title="[bold] Indicateurs techniques [/bold]", border_style="bright_cyan")
 
 
+def build_portfolio_view(states: dict) -> Layout:
+    """Aggregate view across multiple bot instances (deploiement portefeuille)."""
+    rows = []
+    tot_val = tot_start = tot_trades = tot_orders = 0.0
+    earliest = None
+    for label, st in states.items():
+        price = st.get("current_price") or st.get("grid_base_price") or 0
+        val = st.get("portfolio_value", 0)
+        start = st.get("start_portfolio_value") or val
+        pnl = val - start
+        roi = (pnl / start * 100) if start else 0
+        trades = st.get("total_trades", 0)
+        orders = len(st.get("grid_orders", {}))
+        ind = st.get("_indicators", {})
+        inv = ind.get("inventory_ratio", 0) * 100
+        rows.append((label, price, val, pnl, roi, trades, orders, inv))
+        tot_val += val; tot_start += start; tot_trades += trades; tot_orders += orders
+        stt = st.get("start_time", "")
+        if stt and (earliest is None or stt < earliest):
+            earliest = stt
+    rows.sort(key=lambda r: r[3], reverse=True)  # by PnL desc
+
+    tot_pnl = tot_val - tot_start
+    tot_roi = (tot_pnl / tot_start * 100) if tot_start else 0
+    pc = "green" if tot_pnl >= 0 else "red"
+    arrow = "▲" if tot_pnl >= 0 else "▼"
+
+    # Aggregate header
+    hdr = Text()
+    hdr.append("  ◈ PORTEFEUILLE ", style="bold bright_cyan")
+    hdr.append(f"{len(states)} actifs", style="bold white on grey23")
+    hdr.append(f"        {datetime.now(TZ).strftime('%H:%M:%S')}", style="dim italic")
+    hdr.append(f"\n  {arrow} PnL ", style=f"bold {pc}")
+    hdr.append(f"{tot_pnl:+,.2f} USDT ", style=f"bold {pc}")
+    hdr.append(f"({tot_roi:+.2f}%)", style=pc)
+    hdr.append(f"   Valeur ", style="dim")
+    hdr.append(f"${tot_val:,.2f}", style="bold bright_white")
+    hdr.append(f"   Depart ", style="dim")
+    hdr.append(f"${tot_start:,.2f}", style="dim")
+    hdr.append(f"   Trades ", style="dim")
+    hdr.append(f"{int(tot_trades)}", style="bold bright_white")
+    hdr.append(f"   Ordres ", style="dim")
+    hdr.append(f"{int(tot_orders)}", style="bold bright_white")
+    hdr.append(f"   Uptime ", style="dim")
+    hdr.append(f"{format_elapsed(earliest or '')}", style="bright_white")
+
+    # Per-instance table
+    table = Table(show_header=True, header_style="bold bright_white", expand=True,
+                  padding=(0, 1))
+    table.add_column("Actif", style="bold cyan")
+    table.add_column("Prix", justify="right")
+    table.add_column("Valeur", justify="right")
+    table.add_column("PnL", justify="right")
+    table.add_column("ROI", justify="right")
+    table.add_column("Trades", justify="right")
+    table.add_column("Ordres", justify="right")
+    table.add_column("Inv", justify="right")
+    for label, price, val, pnl, roi, trades, orders, inv in rows:
+        c = "green" if pnl >= 0 else "red"
+        table.add_row(
+            label,
+            f"${price:,.4f}" if price < 100 else f"${price:,.2f}",
+            f"${val:,.2f}",
+            Text(f"{pnl:+,.2f}", style=c),
+            Text(f"{roi:+.2f}%", style=c),
+            str(trades),
+            str(orders),
+            f"{inv:.0f}%",
+        )
+
+    layout = Layout()
+    layout.split_column(
+        Layout(Panel(hdr, title="[bold bright_white] PORTEFEUILLE — ROBUST HARVESTER [/bold bright_white]",
+                     border_style="bright_blue"), name="phead", size=6),
+        Layout(Panel(table, title="[bold] Instances [/bold]",
+                     subtitle="[dim]tri par PnL  ·  1 bot par actif  ·  Ctrl+C pour quitter[/dim]",
+                     border_style="green"), name="ptable"),
+    )
+    return layout
+
+
 def build_dashboard(state: dict) -> Layout:
     layout = Layout()
     layout.split_column(
@@ -961,13 +1080,32 @@ def build_dashboard(state: dict) -> Layout:
 def main():
     console = Console()
 
+    # Portfolio mode: arg is a directory or glob matching >=2 state files.
+    portfolio_paths = discover_state_files(STATE_ARG)
+
+    if portfolio_paths:
+        console.print(f"[bold blue]Dashboard Portefeuille[/] — "
+                      f"[dim]{len(portfolio_paths)} instances[/]")
+        console.print(f"[dim]Refresh: {REFRESH_INTERVAL}s | Ctrl+C pour quitter[/]\n")
+        with Live(console=console, refresh_per_second=1, screen=True) as live:
+            while True:
+                states = load_all_states(portfolio_paths)
+                if not states:
+                    live.update(Panel("[bold red]Aucun state lisible[/]", title="Erreur"))
+                else:
+                    live.update(build_portfolio_view(states))
+                time.sleep(REFRESH_INTERVAL)
+        return
+
     if not os.path.exists(STATE_FILE):
         console.print(f"[bold red]Fichier state introuvable: {STATE_FILE}[/]")
         console.print("[dim]Le bot doit tourner pour generer le fichier state.[/]")
-        console.print(f"[dim]Usage: python dashboard.py [path/to/bot_state.json][/]")
+        console.print("[dim]Usage single : python dashboard.py [path/to/bot_state.json][/]")
+        console.print("[dim]Usage portefeuille : python dashboard.py data/   "
+                      "(agrege tous les state_*.json)[/]")
         sys.exit(1)
 
-    console.print(f"[bold blue]Dashboard Grid Bot[/] — [dim]{STATE_FILE}[/]")
+    console.print(f"[bold blue]Dashboard Robust Harvester[/] — [dim]{STATE_FILE}[/]")
     console.print(f"[dim]Refresh: {REFRESH_INTERVAL}s | Ctrl+C pour quitter[/]\n")
 
     with Live(console=console, refresh_per_second=1, screen=True) as live:
